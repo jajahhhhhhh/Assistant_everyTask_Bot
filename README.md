@@ -12,12 +12,17 @@ An **AI-powered personal assistant** Telegram bot that autonomously manages info
 | 📝 **Task Management** | Create, categorise, prioritise, and track tasks |
 | ⏰ **Reminders** | Natural-language reminder scheduling ("in 30 minutes", "tomorrow at 9am") |
 | 📅 **Calendar Integration** | Add events; export as `.ics` (compatible with Google Calendar, iCal, Outlook) |
+| 🚀 **Project Analysis** | Deep AI-powered project analysis with scores, revenue estimates, and recommendations |
+| 🔍 **Smart Extraction** | Auto-scan conversations every 10 messages for actionable items |
+| 🔗 **Link Summarization** | Auto-fetch and summarize shared URLs with multilingual output |
+| 🎤 **Voice Transcription** | Transcribe voice messages using OpenAI Whisper |
 | 📋 **Smart Summaries** | Summarise conversations (short / detailed / executive) |
+| 🌅 **Daily Digest** | AI-generated morning digest with tasks, appointments, and recommendations |
 | 📊 **Progress Reports** | Completion rates, overdue items, weekly summaries |
 | 💡 **Recommendations** | Rule-based insights on workload and priorities |
 | 📄 **File Export** | Export tasks as PDF; export calendar as `.ics` |
 | 🌐 **Translation** | Translate text between 20+ languages with auto-detection |
-| 🧠 **OpenAI Integration** | GPT-powered intent detection, task extraction, translation, and summaries (optional; keyword fallback when no key) |
+| 🧠 **OpenAI Integration** | GPT-powered intent detection, task extraction, translation, voice transcription, and summaries |
 
 ---
 
@@ -38,7 +43,12 @@ Assistant_everyTask_Bot/
 │   ├── files.py                  # PDF / text file generation
 │   ├── analytics.py              # Progress reports and recommendations
 │   ├── context.py                # Persistent conversational memory
-│   └── translator.py             # Multi-language translation (20+ languages)
+│   ├── translator.py             # Multi-language translation (20+ languages)
+│   ├── voice.py                  # Voice transcription (Whisper)
+│   ├── links.py                  # Link fetching and summarization
+│   ├── projects.py               # Project management and AI analysis
+│   ├── digest.py                 # Daily digest generation
+│   └── autoscan.py               # Auto-extraction of actionable items
 └── tests/
     ├── test_storage.py
     ├── test_processor.py
@@ -67,7 +77,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and set:
 #   TELEGRAM_BOT_TOKEN  — get from @BotFather on Telegram
-#   OPENAI_API_KEY      — optional, enables GPT-powered processing
+#   OPENAI_API_KEY      — optional, enables GPT-powered processing, voice transcription
 ```
 
 ### 3. Run
@@ -88,6 +98,23 @@ python bot.py
 | `/done <id>` | Mark a task as done |
 | `/exporttasks` | Export tasks as a PDF file |
 
+### Smart Extraction 🔍
+| Command | Description |
+|---------|-------------|
+| `/scan` | Scan conversation for actionable items |
+| `/save` | Save pending extracted items |
+| `/skip` | Skip/discard pending items |
+
+*Auto-scan runs every 10 messages automatically!*
+
+### Projects 🚀
+| Command | Description |
+|---------|-------------|
+| `/projects` | List all projects |
+| `/analyze <project>` | Deep AI analysis with scores & recommendations |
+
+**Example:** `/analyze Villa rental business on Koh Samui`
+
 ### Reminders
 | Command | Description |
 |---------|-------------|
@@ -105,10 +132,12 @@ python bot.py
 
 **Example:** `/addevent Team standup at tomorrow 10am`
 
-### Insights
+### Summaries & Insights
 | Command | Description |
 |---------|-------------|
 | `/summary [short\|detailed\|executive]` | Summarise recent conversation |
+| `/brief` | Quick 3-5 bullet point summary |
+| `/digest` | Generate AI-powered daily digest |
 | `/status` | Task progress report |
 | `/weekly` | Weekly activity summary |
 | `/insights` | Recommendations based on your task list |
@@ -122,12 +151,22 @@ python bot.py
 | `/detect <text>` | Detect language of text |
 | `/langs` | List all supported languages |
 
+**Quick Translation Shortcuts:**
+| Command | Description |
+|---------|-------------|
+| `/ruth <text>` | Russian → Thai |
+| `/thru <text>` | Thai → Russian |
+| `/ruen <text>` | Russian → English |
+| `/enru <text>` | English → Russian |
+| `/then <text>` | Thai → English |
+| `/enth <text>` | English → Thai |
+
 **Supported Languages:** English, Thai, Russian, Chinese, Japanese, Korean, Spanish, French, German, Italian, Portuguese, Vietnamese, Arabic, Hindi, Indonesian, Malay, Ukrainian, Dutch, Polish, Turkish
 
 **Examples:**
 - `/tr th Hello, how are you?` → Translates to Thai
-- `/tr russian Good morning` → Translates to Russian
-- `/trmulti th,ru,zh Hello world` → Translates to Thai, Russian, and Chinese
+- `/ruth Доброе утро` → Russian to Thai
+- `/trmulti th,ru,zh Hello world` → Multi-translate
 - `/detect Bonjour` → Detects French
 
 ### Other
@@ -136,12 +175,30 @@ python bot.py
 | `/start` | Welcome message |
 | `/help` | Full command reference |
 
-### Free-form messages
-Send any message and the assistant will automatically:
+### Auto-Features 🤖
+
+**Free-form messages:** Send any message and the assistant will automatically:
 - Detect your intent (task, reminder, calendar, summary…)
 - Extract and save actionable tasks
 - Schedule reminders or create calendar events if detected
 - Confirm what was captured
+
+**Link Summarization:** Share any URL and the bot will:
+- Fetch and parse the page
+- Generate multilingual summaries (TH/RU/EN)
+- Auto-detect property listings
+- Save listings as tasks
+
+**Voice Transcription:** Send a voice message and the bot will:
+- Transcribe using OpenAI Whisper
+- Auto-detect language
+- Extract tasks from transcribed text
+- Detect property listings
+
+**Auto-Scan:** Every 10 messages, the bot will:
+- Scan conversation for actionable items
+- Present found items for review
+- Let you `/save` or `/skip` them
 
 ---
 
