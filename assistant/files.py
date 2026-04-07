@@ -4,7 +4,7 @@ File management — export tasks and summaries as PDF or plain-text files.
 
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +29,7 @@ class _PDF(FPDF):
         self.set_font("Helvetica", "B", 14)
         self.cell(0, 10, self._doc_title, ln=True, align="C")
         self.set_font("Helvetica", "", 9)
-        self.cell(0, 6, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
+        self.cell(0, 6, f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
         self.ln(4)
         self.line(self.get_x(), self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(4)
@@ -82,7 +82,7 @@ def export_tasks_pdf(
     exports_dir = Path(config.EXPORTS_DIR)
     exports_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
-        filename = f"tasks_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+        filename = f"tasks_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
     filepath = exports_dir / filename
     pdf.output(str(filepath))
     logger.info("Exported %d tasks to %s", len(user_tasks), filepath)
@@ -105,7 +105,7 @@ def export_summary_pdf(
     exports_dir = Path(config.EXPORTS_DIR)
     exports_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
-        filename = f"summary_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+        filename = f"summary_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.pdf"
     filepath = exports_dir / filename
     pdf.output(str(filepath))
     logger.info("Exported summary to %s", filepath)
@@ -122,7 +122,7 @@ def export_tasks_text(
     exports_dir = Path(config.EXPORTS_DIR)
     exports_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
-        filename = f"tasks_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+        filename = f"tasks_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
     filepath = exports_dir / filename
 
     content = task_module.format_task_list(user_tasks)

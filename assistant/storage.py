@@ -11,7 +11,7 @@ Tables:
 import sqlite3
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -87,7 +87,7 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 def save_message(conn: sqlite3.Connection, user_id: int, text: str, role: str = "user") -> int:
     """Persist a conversation message and return its row id."""
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO messages (user_id, role, text, timestamp) VALUES (?, ?, ?, ?)",
         (user_id, role, text, ts),
@@ -119,7 +119,7 @@ def create_task(
     deadline: Optional[str] = None,
 ) -> int:
     """Insert a new task and return its id."""
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         """INSERT INTO tasks
                (user_id, title, description, category, priority, deadline, status, created_at)
@@ -185,7 +185,7 @@ def create_reminder(
 
 def get_pending_reminders(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """Return all unsent reminders whose time has passed."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     rows = conn.execute(
         "SELECT * FROM reminders WHERE sent=0 AND remind_at <= ?", (now,)
     ).fetchall()
@@ -227,7 +227,7 @@ def create_event(
     location: str = "",
 ) -> int:
     """Insert a calendar event and return its id."""
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         """INSERT INTO calendar_events
                (user_id, title, description, start_time, end_time, location, created_at)

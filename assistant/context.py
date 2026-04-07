@@ -9,6 +9,7 @@ Provides a thin wrapper that:
 
 import logging
 import sqlite3
+import threading
 from typing import Any, Dict, List, Optional
 
 from assistant import storage
@@ -20,16 +21,18 @@ _CACHE_LIMIT = 50
 
 # Per-user in-memory context cache  {user_id: {...}}
 _context_cache: Dict[int, Dict[str, Any]] = {}
+_cache_lock = threading.Lock()
 
 
 def _get_cache(user_id: int) -> Dict[str, Any]:
-    if user_id not in _context_cache:
-        _context_cache[user_id] = {
-            "last_intent": None,
-            "last_tasks": [],
-            "message_count": 0,
-        }
-    return _context_cache[user_id]
+    with _cache_lock:
+        if user_id not in _context_cache:
+            _context_cache[user_id] = {
+                "last_intent": None,
+                "last_tasks": [],
+                "message_count": 0,
+            }
+        return _context_cache[user_id]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -75,4 +78,5 @@ def get_last_tasks(user_id: int) -> List[Dict[str, Any]]:
 
 def clear_context(user_id: int) -> None:
     """Reset the in-memory context for *user_id* (does not delete DB records)."""
-    _context_cache.pop(user_id, None)
+    with _cache_lock:
+        _context_cache.pop(user_id, None)

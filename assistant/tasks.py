@@ -5,7 +5,7 @@ with NLP-driven task extraction.
 
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from assistant import processor, storage
@@ -50,7 +50,7 @@ def add_task(
         "priority": priority,
         "deadline": deadline,
         "status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

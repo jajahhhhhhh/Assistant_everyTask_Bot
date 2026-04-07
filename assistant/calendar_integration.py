@@ -4,7 +4,7 @@ Calendar integration — manage events and export them as iCal (.ics) files.
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,7 +51,7 @@ def get_upcoming_events(
     conn: sqlite3.Connection, user_id: int, days: int = 7
 ) -> List[Dict[str, Any]]:
     """Return events in the next *days* days for *user_id*."""
-    from_dt = datetime.utcnow()
+    from_dt = datetime.now(timezone.utc)
     events = storage.get_events(conn, user_id, from_dt=from_dt)
     cutoff = (from_dt + timedelta(days=days)).isoformat()
     return [e for e in events if e["start_time"] <= cutoff]
@@ -121,7 +121,7 @@ def export_ical(
     exports_dir = Path(config.EXPORTS_DIR)
     exports_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
-        filename = f"calendar_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.ics"
+        filename = f"calendar_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.ics"
     filepath = exports_dir / filename
 
     with open(filepath, "wb") as fh:

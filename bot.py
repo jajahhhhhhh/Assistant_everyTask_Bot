@@ -28,7 +28,7 @@ import asyncio
 import logging
 import sys
 
-from telegram import Update, Document
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -385,6 +385,14 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    # Start health check server for Railway/Render hosting
+    try:
+        import keep_alive
+        keep_alive.start()
+        logger.info("Health check server started")
+    except Exception:
+        pass
+
     if not config.TELEGRAM_BOT_TOKEN:
         logger.error(
             "TELEGRAM_BOT_TOKEN is not set. "

@@ -4,7 +4,7 @@ Analytics engine — insights, progress reports, and recommendations.
 
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from assistant import storage
@@ -25,7 +25,7 @@ def task_progress_report(conn: sqlite3.Connection, user_id: int) -> str:
 
     counts: Dict[str, int] = {}
     overdue: List[Dict[str, Any]] = []
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for task in all_tasks:
         status = task.get("status", "pending")
@@ -62,13 +62,13 @@ def weekly_summary(conn: sqlite3.Connection, user_id: int) -> str:
     Return a concise weekly activity summary (tasks created / completed,
     reminders fired, upcoming events).
     """
-    one_week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    one_week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
     all_tasks = storage.get_tasks(conn, user_id)
     recent_tasks = [t for t in all_tasks if t.get("created_at", "") >= one_week_ago]
     completed = [t for t in recent_tasks if t.get("status") == "done"]
 
-    events = storage.get_events(conn, user_id, from_dt=datetime.utcnow())
+    events = storage.get_events(conn, user_id, from_dt=datetime.now(timezone.utc))
     upcoming = events[:5]
 
     lines = [

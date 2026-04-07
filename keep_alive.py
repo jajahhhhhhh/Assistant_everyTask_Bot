@@ -7,7 +7,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Booster_brain bot is running!")
+        self.wfile.write(b"Assistant_everyTask_Bot is running!")
     def log_message(self, *args):
         pass  # Suppress logs
 
