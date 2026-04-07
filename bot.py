@@ -17,6 +17,11 @@ Commands:
     /status         — Progress report
     /insights       — Recommendations
     /weekly         — Weekly summary
+    /translate <lang> <text> — Translate text to target language
+    /tr <lang> <text>        — Shorthand for /translate
+    /trmulti <langs> <text>  — Translate to multiple languages
+    /detect <text>           — Detect language of text
+    /langs                   — List supported languages
 
 Any free-form message is processed by the AI:
   • Tasks are extracted and stored automatically.
@@ -48,6 +53,7 @@ from assistant import (
     reminders as reminder_module,
     storage,
     tasks as task_module,
+    translator,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +102,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/calendar — Upcoming events (7 days)\n"
         "/addevent `<title> at <datetime>` — Add an event\n"
         "/exportcal — Export calendar as .ics\n\n"
+        "*Translation* 🌐\n"
+        "/translate `<lang> <text>` — Translate text\n"
+        "/tr `<lang> <text>` — Shorthand for translate\n"
+        "/trmulti `<lang1,lang2> <text>` — Multi-translate\n"
+        "/detect `<text>` — Detect language\n"
+        "/langs — List supported languages\n\n"
         "*Insights*\n"
         "/summary — Summarise recent conversation\n"
         "/status — Progress report\n"
@@ -285,6 +297,155 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+# ── /translate or /tr ─────────────────────────────────────────────────────────
+
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Translate text to a target language.
+    Usage: /translate <lang> <text>
+           /tr <lang> <text>
+    
+    Examples:
+        /translate th Hello, how are you?
+        /tr russian Доброе утро
+        /translate en สวัสดีครับ
+    """
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "🌐 *Translation*\n\n"
+            "Usage: `/translate <language> <text>`\n"
+            "       `/tr <language> <text>`\n\n"
+            "Examples:\n"
+            "  `/tr th Hello, how are you?`\n"
+            "  `/tr russian Good morning`\n"
+            "  `/tr en สวัสดีครับ`\n\n"
+            "Use /langs to see all supported languages.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    
+    target_lang = context.args[0]
+    text_to_translate = " ".join(context.args[1:])
+    
+    # Validate target language
+    target_code = translator.resolve_language_code(target_lang)
+    if not target_code:
+        await update.message.reply_text(
+            f"❌ Unknown language: `{target_lang}`\n\n"
+            f"Use /langs to see supported languages.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    
+    # Perform translation
+    result = translator.translate(text_to_translate, target_code)
+    response = translator.format_translation_result(result)
+    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── /langs ────────────────────────────────────────────────────────────────────
+
+async def cmd_langs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all supported languages for translation."""
+    text = translator.format_language_list()
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── /detect ───────────────────────────────────────────────────────────────────
+
+async def cmd_detect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Detect the language of the given text.
+    Usage: /detect <text>
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/detect <text>`\n\n"
+            "Example: `/detect Bonjour, comment ça va?`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    
+    text = " ".join(context.args)
+    response = translator.format_detected_language(text)
+    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── /trmulti ──────────────────────────────────────────────────────────────────
+
+async def cmd_translate_multi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Translate text to multiple languages at once.
+    Usage: /trmulti <lang1,lang2,lang3> <text>
+    
+    Example: /trmulti th,ru,zh Hello world
+    """
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "🌍 *Multi-Translation*\n\n"
+            "Usage: `/trmulti <lang1,lang2,...> <text>`\n\n"
+            "Example:\n"
+            "  `/trmulti th,ru,zh Hello world`\n"
+            "  `/trmulti en,ja,ko สวัสดี`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    
+    langs_str = context.args[0]
+    text_to_translate = " ".join(context.args[1:])
+    
+    # Parse target languages
+    target_langs = [lang.strip() for lang in langs_str.split(",")]
+    
+    # Validate all languages
+    valid_langs = []
+    invalid_langs = []
+    for lang in target_langs:
+        code = translator.resolve_language_code(lang)
+        if code:
+            valid_langs.append(code)
+        else:
+            invalid_langs.append(lang)
+    
+    if invalid_langs:
+        await update.message.reply_text(
+            f"❌ Unknown language(s): {', '.join(invalid_langs)}\n"
+            f"Use /langs to see supported languages.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    
+    if not valid_langs:
+        await update.message.reply_text("❌ No valid languages specified.")
+        return
+    
+    # Translate to all languages
+    results = translator.translate_multi(text_to_translate, valid_langs)
+    
+    # Format response
+    source_lang = None
+    lines = ["🌍 *Multi-Translation*\n"]
+    
+    for lang_code, result in results.items():
+        if source_lang is None and result.get("source_lang"):
+            source_lang = result["source_lang"]
+        
+        flag = translator.LANGUAGE_FLAGS.get(lang_code, "🌐")
+        name = translator.SUPPORTED_LANGUAGES.get(lang_code, lang_code)
+        
+        if result.get("success"):
+            lines.append(f"{flag} *{name}*: {result['translated_text']}")
+        else:
+            lines.append(f"{flag} *{name}*: ❌ {result.get('error', 'Failed')}")
+    
+    if source_lang:
+        src_flag = translator.LANGUAGE_FLAGS.get(source_lang, "🌐")
+        src_name = translator.SUPPORTED_LANGUAGES.get(source_lang, source_lang)
+        lines.insert(1, f"_Source: {src_flag} {src_name}_\n")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 # ── Free-form message handler ─────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -377,6 +538,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("insights", cmd_insights))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
+    
+    # Translation commands
+    app.add_handler(CommandHandler("translate", cmd_translate))
+    app.add_handler(CommandHandler("tr", cmd_translate))
+    app.add_handler(CommandHandler("langs", cmd_langs))
+    app.add_handler(CommandHandler("detect", cmd_detect))
+    app.add_handler(CommandHandler("trmulti", cmd_translate_multi))
 
     # Free-form messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

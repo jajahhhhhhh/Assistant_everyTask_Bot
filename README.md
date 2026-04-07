@@ -16,7 +16,8 @@ An **AI-powered personal assistant** Telegram bot that autonomously manages info
 | 📊 **Progress Reports** | Completion rates, overdue items, weekly summaries |
 | 💡 **Recommendations** | Rule-based insights on workload and priorities |
 | 📄 **File Export** | Export tasks as PDF; export calendar as `.ics` |
-| 🧠 **OpenAI Integration** | GPT-powered intent detection, task extraction, and summaries (optional; keyword fallback when no key) |
+| 🌐 **Translation** | Translate text between 20+ languages with auto-detection |
+| 🧠 **OpenAI Integration** | GPT-powered intent detection, task extraction, translation, and summaries (optional; keyword fallback when no key) |
 
 ---
 
@@ -36,14 +37,16 @@ Assistant_everyTask_Bot/
 │   ├── calendar_integration.py   # Calendar events + iCal export
 │   ├── files.py                  # PDF / text file generation
 │   ├── analytics.py              # Progress reports and recommendations
-│   └── context.py                # Persistent conversational memory
+│   ├── context.py                # Persistent conversational memory
+│   └── translator.py             # Multi-language translation (20+ languages)
 └── tests/
     ├── test_storage.py
     ├── test_processor.py
     ├── test_tasks.py
     ├── test_reminders.py
     ├── test_analytics.py
-    └── test_calendar.py
+    ├── test_calendar.py
+    └── test_translator.py
 ```
 
 ---
@@ -109,6 +112,23 @@ python bot.py
 | `/status` | Task progress report |
 | `/weekly` | Weekly activity summary |
 | `/insights` | Recommendations based on your task list |
+
+### Translation 🌐
+| Command | Description |
+|---------|-------------|
+| `/translate <lang> <text>` | Translate text to target language |
+| `/tr <lang> <text>` | Shorthand for translate |
+| `/trmulti <lang1,lang2> <text>` | Translate to multiple languages |
+| `/detect <text>` | Detect language of text |
+| `/langs` | List all supported languages |
+
+**Supported Languages:** English, Thai, Russian, Chinese, Japanese, Korean, Spanish, French, German, Italian, Portuguese, Vietnamese, Arabic, Hindi, Indonesian, Malay, Ukrainian, Dutch, Polish, Turkish
+
+**Examples:**
+- `/tr th Hello, how are you?` → Translates to Thai
+- `/tr russian Good morning` → Translates to Russian
+- `/trmulti th,ru,zh Hello world` → Translates to Thai, Russian, and Chinese
+- `/detect Bonjour` → Detects French
 
 ### Other
 | Command | Description |
