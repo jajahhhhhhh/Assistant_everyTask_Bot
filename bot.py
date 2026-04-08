@@ -63,7 +63,7 @@ from assistant import (
     files as file_module,
     links as links_module,
     processor,
-    projects as projects_module,
+    
     reminders as reminder_module,
     storage,
     tasks as task_module,
