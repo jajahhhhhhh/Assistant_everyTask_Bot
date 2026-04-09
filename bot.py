@@ -23,7 +23,7 @@ import aiohttp
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATA_DIR = os.getenv("DATA_DIR", "data")
 DB_PATH = f"{DATA_DIR}/assistant.db"
