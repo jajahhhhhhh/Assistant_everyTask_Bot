@@ -1,418 +1,1198 @@
 """
-AI Personal Assistant — Telegram bot entry point.
-
-Commands:
-    /start          — Welcome message
-    /help           — Command reference
-    /tasks          — List all your tasks
-    /addtask <text> — Create a task manually
-    /done <id>      — Mark a task as done
-    /summary        — Summarise recent conversation
-    /remind <time> <message> — Set a reminder
-    /reminders      — List upcoming reminders
-    /calendar       — List upcoming calendar events
-    /addevent <title> at <datetime> — Add a calendar event
-    /exporttasks    — Export tasks as PDF
-    /exportcal      — Export calendar as .ics file
-    /status         — Progress report
-    /insights       — Recommendations
-    /weekly         — Weekly summary
-
-Any free-form message is processed by the AI:
-  • Tasks are extracted and stored automatically.
-  • Reminders and events are created if detected.
-  • A confirmation is sent back to the user.
+Assistant_everyTask_Bot - With User Storage Settings
+Users can connect their own Airtable, Google Sheets, or Google Drive!
 """
 
-import asyncio
+import os
+import sqlite3
 import logging
-import sys
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
 
-from telegram import Update, Document
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes
 )
+import openai
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import aiohttp
 
-import config
-from assistant import (
-    analytics,
-    calendar_integration,
-    context as ctx_module,
-    files as file_module,
-    processor,
-    reminders as reminder_module,
-    storage,
-    tasks as task_module,
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+DB_PATH = f"{DATA_DIR}/assistant.db"
+
+# Ensure data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-
 logger = logging.getLogger(__name__)
 
-# ── Database connection (shared across handlers via bot_data) ─────────────────
+# OpenAI setup
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
-def get_conn(context: ContextTypes.DEFAULT_TYPE):
-    if "db_conn" not in context.bot_data:
-        context.bot_data["db_conn"] = storage.init_db()
-    return context.bot_data["db_conn"]
+# Conversation states for settings
+(AWAITING_STORAGE_CHOICE, AWAITING_AIRTABLE_KEY, AWAITING_AIRTABLE_BASE, 
+ AWAITING_AIRTABLE_TABLE, AWAITING_SHEETS_ID) = range(5)
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATABASE SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def init_db():
+    """Initialize the SQLite database with all tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Tasks table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            priority TEXT DEFAULT 'medium',
+            status TEXT DEFAULT 'todo',
+            due_date TEXT,
+            project TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+    """)
+    
+    # Reminders table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            remind_at TIMESTAMP NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Notes table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Calendar events table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            start_time TIMESTAMP NOT NULL,
+            end_time TIMESTAMP,
+            location TEXT,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # User storage settings table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_storage_settings (
+            user_id INTEGER PRIMARY KEY,
+            storage_type TEXT DEFAULT 'local',
+            airtable_api_key TEXT,
+            airtable_base_id TEXT,
+            airtable_table_name TEXT DEFAULT 'Tasks',
+            google_sheet_id TEXT,
+            google_drive_folder_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STORAGE SETTINGS MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StorageSettings:
+    """Manage user storage preferences"""
+    
+    @staticmethod
+    def get_settings(user_id: int) -> Dict[str, Any]:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT storage_type, airtable_api_key, airtable_base_id, 
+                   airtable_table_name, google_sheet_id
+            FROM user_storage_settings WHERE user_id = ?
+        """, (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                "storage_type": row[0] or "local",
+                "airtable_api_key": row[1],
+                "airtable_base_id": row[2],
+                "airtable_table_name": row[3] or "Tasks",
+                "google_sheet_id": row[4]
+            }
+        return {"storage_type": "local"}
+    
+    @staticmethod
+    def set_storage_type(user_id: int, storage_type: str):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings (user_id, storage_type, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET 
+                storage_type = excluded.storage_type,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, storage_type))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def set_airtable(user_id: int, api_key: str, base_id: str, table_name: str = "Tasks"):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings 
+                (user_id, storage_type, airtable_api_key, airtable_base_id, airtable_table_name, updated_at)
+            VALUES (?, 'airtable', ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET 
+                storage_type = 'airtable',
+                airtable_api_key = excluded.airtable_api_key,
+                airtable_base_id = excluded.airtable_base_id,
+                airtable_table_name = excluded.airtable_table_name,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, api_key, base_id, table_name))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def set_google_sheets(user_id: int, sheet_id: str):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings 
+                (user_id, storage_type, google_sheet_id, updated_at)
+            VALUES (?, 'sheets', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET 
+                storage_type = 'sheets',
+                google_sheet_id = excluded.google_sheet_id,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, sheet_id))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def reset_to_local(user_id: int):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE user_storage_settings 
+            SET storage_type = 'local',
+                airtable_api_key = NULL,
+                airtable_base_id = NULL,
+                google_sheet_id = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (user_id,))
+        conn.commit()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AIRTABLE INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AirtableClient:
+    """Airtable API client for user's personal base"""
+    
+    BASE_URL = "https://api.airtable.com/v0"
+    
+    def __init__(self, api_key: str, base_id: str, table_name: str = "Tasks"):
+        self.api_key = api_key
+        self.base_id = base_id
+        self.table_name = table_name
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+    
+    @property
+    def url(self) -> str:
+        return f"{self.BASE_URL}/{self.base_id}/{self.table_name}"
+    
+    async def test_connection(self) -> Dict[str, Any]:
+        """Test if connection works"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.url, headers=self.headers, params={"maxRecords": 1}
+                ) as response:
+                    if response.status == 200:
+                        return {"success": True, "message": "✅ Connected to Airtable!"}
+                    elif response.status == 401:
+                        return {"success": False, "message": "❌ Invalid API Key"}
+                    elif response.status == 404:
+                        return {"success": False, "message": "❌ Base or Table not found"}
+                    else:
+                        return {"success": False, "message": f"❌ Error: {response.status}"}
+        except Exception as e:
+            return {"success": False, "message": f"❌ Error: {str(e)}"}
+    
+    async def add_task(self, user_id: int, title: str, priority: str = "medium",
+                       due_date: str = None) -> bool:
+        """Add a task to Airtable"""
+        fields = {
+            "Title": title,
+            "User ID": str(user_id),
+            "Priority": priority,
+            "Status": "todo",
+            "Created": datetime.now().isoformat()
+        }
+        if due_date:
+            fields["Due Date"] = due_date
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.url, headers=self.headers, json={"fields": fields}
+                ) as response:
+                    return response.status == 200
+        except:
+            return False
+    
+    async def get_tasks(self, user_id: int) -> List[Dict]:
+        """Get tasks from Airtable"""
+        try:
+            params = {"filterByFormula": f"{{User ID}} = '{user_id}'"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.url, headers=self.headers, params=params
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return [
+                            {
+                                "id": r["id"],
+                                "title": r["fields"].get("Title", ""),
+                                "priority": r["fields"].get("Priority", "medium"),
+                                "status": r["fields"].get("Status", "todo"),
+                                "due_date": r["fields"].get("Due Date")
+                            }
+                            for r in data.get("records", [])
+                        ]
+            return []
+        except:
+            return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GoogleSheetsClient:
+    """Simple Google Sheets client (public sheets only)"""
+    
+    API_URL = "https://sheets.googleapis.com/v4/spreadsheets"
+    
+    def __init__(self, sheet_id: str):
+        self.sheet_id = sheet_id
+    
+    async def test_connection(self) -> Dict[str, Any]:
+        """Test if the sheet is accessible"""
+        try:
+            # For public sheets, we can test with export URL
+            url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/export?format=csv&range=A1"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        return {"success": True, "message": "✅ Connected to Google Sheets!"}
+                    else:
+                        return {"success": False, "message": "❌ Sheet not accessible. Make sure it's shared publicly."}
+        except Exception as e:
+            return {"success": False, "message": f"❌ Error: {str(e)}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIFIED STORAGE MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Storage:
+    """Routes storage operations to the correct backend"""
+    
+    @staticmethod
+    def _get_backend(user_id: int):
+        settings = StorageSettings.get_settings(user_id)
+        storage_type = settings.get("storage_type", "local")
+        
+        if storage_type == "airtable" and settings.get("airtable_api_key"):
+            return AirtableClient(
+                settings["airtable_api_key"],
+                settings["airtable_base_id"],
+                settings.get("airtable_table_name", "Tasks")
+            )
+        elif storage_type == "sheets" and settings.get("google_sheet_id"):
+            return GoogleSheetsClient(settings["google_sheet_id"])
+        
+        return None  # Use local SQLite
+    
+    # ─── Task Operations ─────────────────────────────────────────────────────
+    
+    @staticmethod
+    async def add_task(user_id: int, title: str, priority: str = "medium",
+                       due_date: str = None, project: str = None) -> int:
+        """Add a task - routes to correct backend"""
+        backend = Storage._get_backend(user_id)
+        
+        if isinstance(backend, AirtableClient):
+            success = await backend.add_task(user_id, title, priority, due_date)
+            if success:
+                return 1  # Return dummy ID for external storage
+        
+        # Default: local SQLite
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO tasks (user_id, title, priority, due_date, project)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, title, priority, due_date, project))
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return task_id
+    
+    @staticmethod
+    async def get_tasks(user_id: int, status: str = None) -> List[Dict]:
+        """Get tasks - routes to correct backend"""
+        backend = Storage._get_backend(user_id)
+        
+        if isinstance(backend, AirtableClient):
+            return await backend.get_tasks(user_id)
+        
+        # Default: local SQLite
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        if status:
+            cursor.execute("""
+                SELECT id, title, priority, status, due_date, project, created_at
+                FROM tasks WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC
+            """, (user_id, status))
+        else:
+            cursor.execute("""
+                SELECT id, title, priority, status, due_date, project, created_at
+                FROM tasks WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (user_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "id": row[0],
+                "title": row[1],
+                "priority": row[2],
+                "status": row[3],
+                "due_date": row[4],
+                "project": row[5],
+                "created_at": row[6]
+            }
+            for row in rows
+        ]
+    
+    @staticmethod
+    async def complete_task(user_id: int, task_id: int) -> bool:
+        """Mark task as complete"""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tasks SET status = 'done', completed_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND user_id = ?
+        """, (task_id, user_id))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+    
+    # ─── Reminder Operations ─────────────────────────────────────────────────
+    
+    @staticmethod
+    async def add_reminder(user_id: int, text: str, remind_at: datetime) -> int:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO reminders (user_id, text, remind_at)
+            VALUES (?, ?, ?)
+        """, (user_id, text, remind_at.isoformat()))
+        reminder_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return reminder_id
+    
+    @staticmethod
+    async def get_reminders(user_id: int) -> List[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, text, remind_at, status
+            FROM reminders WHERE user_id = ? AND status = 'pending'
+            ORDER BY remind_at ASC
+        """, (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{"id": r[0], "text": r[1], "remind_at": r[2], "status": r[3]} for r in rows]
+    
+    # ─── Note Operations ─────────────────────────────────────────────────────
+    
+    @staticmethod
+    async def add_note(user_id: int, content: str, tags: str = None) -> int:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO notes (user_id, content, tags)
+            VALUES (?, ?, ?)
+        """, (user_id, content, tags))
+        note_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return note_id
+    
+    @staticmethod
+    async def get_notes(user_id: int, search: str = None) -> List[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        if search:
+            cursor.execute("""
+                SELECT id, content, tags, created_at
+                FROM notes WHERE user_id = ? AND content LIKE ?
+                ORDER BY created_at DESC
+            """, (user_id, f"%{search}%"))
+        else:
+            cursor.execute("""
+                SELECT id, content, tags, created_at
+                FROM notes WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{"id": r[0], "content": r[1], "tags": r[2], "created_at": r[3]} for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETUP STATE TRACKING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+user_setup_state: Dict[int, Dict[str, Any]] = {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
     user = update.effective_user
-    text = (
-        f"👋 Hello {user.first_name}! I'm your AI Personal Assistant.\n\n"
-        "I can help you:\n"
-        "• 📝 Track and manage tasks\n"
-        "• 📅 Schedule calendar events\n"
-        "• ⏰ Set reminders\n"
-        "• 📊 Summarise conversations\n"
-        "• 💡 Provide insights and recommendations\n\n"
-        "Just send me a message and I'll extract tasks and actions automatically, "
-        "or use /help for a full command list."
-    )
-    await update.message.reply_text(text)
+    
+    text = f"""
+👋 **สวัสดี {user.first_name}!** / Hello!
+
+ฉันคือ **Assistant Bot** ผู้ช่วยจัดการงานส่วนตัวของคุณ!
+
+🇹🇭 **คำสั่งภาษาไทย:**
+• `/task ซื้อของ` - เพิ่มงาน
+• `/remind 30m โทรหาลูกค้า` - ตั้งเตือน
+• `/note บันทึกสำคัญ` - จดโน้ต
+
+🇬🇧 **English Commands:**
+• `/task Buy groceries` - Add task
+• `/remind 1h Call client` - Set reminder  
+• `/note Important meeting points` - Save note
+
+⚙️ **Storage Settings:**
+• `/settings` - Connect your own Airtable, Google Sheets, or Drive!
+
+📋 **More Commands:**
+• `/tasks` - View all tasks
+• `/done 1` - Complete task #1
+• `/reminders` - View reminders
+• `/notes` - View notes
+• `/help` - Full help
+
+💡 Or just type naturally: "remind me to call mom in 2 hours"
+"""
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    text = """
+📖 **คู่มือการใช้งาน / User Guide**
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "📖 *Command Reference*\n\n"
-        "*Task Management*\n"
-        "/tasks — List all tasks\n"
-        "/addtask `<description>` — Add a task\n"
-        "/done `<id>` — Mark task as done\n"
-        "/exporttasks — Export tasks as PDF\n\n"
-        "*Reminders*\n"
-        "/remind `<time> | <message>` — Set a reminder\n"
-        "  e.g. `/remind tomorrow 9am | Call Alice`\n"
-        "/reminders — List upcoming reminders\n\n"
-        "*Calendar*\n"
-        "/calendar — Upcoming events (7 days)\n"
-        "/addevent `<title> at <datetime>` — Add an event\n"
-        "/exportcal — Export calendar as .ics\n\n"
-        "*Insights*\n"
-        "/summary — Summarise recent conversation\n"
-        "/status — Progress report\n"
-        "/weekly — Weekly summary\n"
-        "/insights — Recommendations\n\n"
-        "💬 *Free-form message* — I'll extract tasks and actions automatically!"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+━━━━━━━━━━━━━━━━━━━━
+✅ **Tasks / งาน**
+━━━━━━━━━━━━━━━━━━━━
+`/task <title>` - เพิ่มงาน / Add task
+`/tasks` - ดูรายการงาน / List tasks
+`/done <id>` - เสร็จงาน / Complete task
+`/delete <id>` - ลบงาน / Delete task
+
+━━━━━━━━━━━━━━━━━━━━
+⏰ **Reminders / เตือนความจำ**
+━━━━━━━━━━━━━━━━━━━━
+`/remind <time> <text>` - ตั้งเตือน
+Examples:
+• `/remind 30m call mom`
+• `/remind 2h meeting`
+• `/remind 1d birthday`
+
+━━━━━━━━━━━━━━━━━━━━
+📝 **Notes / บันทึก**
+━━━━━━━━━━━━━━━━━━━━
+`/note <content>` - บันทึกโน้ต
+`/notes` - ดูโน้ตทั้งหมด
+`/search <keyword>` - ค้นหาโน้ต
+
+━━━━━━━━━━━━━━━━━━━━
+⚙️ **Settings / ตั้งค่า**
+━━━━━━━━━━━━━━━━━━━━
+`/settings` - เชื่อมต่อ Airtable/Sheets
+`/mystorage` - ดูการตั้งค่าปัจจุบัน
+
+━━━━━━━━━━━━━━━━━━━━
+🤖 **AI / ฉลาด**
+━━━━━━━━━━━━━━━━━━━━
+Just type naturally!
+• "remind me to buy milk tomorrow"
+• "add task call client urgent"
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── /tasks ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# TASK COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new task"""
     user_id = update.effective_user.id
-    tasks = storage.get_tasks(conn, user_id)
-    text = task_module.format_task_list(tasks)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-# ── /addtask ──────────────────────────────────────────────────────────────────
-
-async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    user_id = update.effective_user.id
-    description = " ".join(context.args) if context.args else ""
-    if not description:
-        await update.message.reply_text("Usage: /addtask <description>")
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📝 Please provide a task title:\n"
+            "`/task Buy groceries`",
+            parse_mode="Markdown"
+        )
         return
-    task = task_module.add_task(conn, user_id, title=description)
+    
+    title = " ".join(context.args)
+    
+    # Detect priority from text
+    priority = "medium"
+    title_lower = title.lower()
+    if any(w in title_lower for w in ["urgent", "ด่วน", "asap"]):
+        priority = "urgent"
+    elif any(w in title_lower for w in ["important", "สำคัญ", "high"]):
+        priority = "high"
+    elif any(w in title_lower for w in ["low", "ต่ำ", "later"]):
+        priority = "low"
+    
+    task_id = await Storage.add_task(user_id, title, priority)
+    
+    settings = StorageSettings.get_settings(user_id)
+    storage_icon = {
+        "local": "📱",
+        "airtable": "📊",
+        "sheets": "📄",
+        "drive": "📁"
+    }.get(settings.get("storage_type", "local"), "📱")
+    
     await update.message.reply_text(
-        f"✅ Task added:\n{task_module.format_task(task)}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ **Task Added!**\n\n"
+        f"📋 {title}\n"
+        f"🔴 Priority: {priority}\n"
+        f"{storage_icon} Storage: {settings.get('storage_type', 'local').title()}\n\n"
+        f"Use `/done {task_id}` to complete",
+        parse_mode="Markdown"
     )
 
 
-# ── /done ─────────────────────────────────────────────────────────────────────
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /done <task_id>")
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all tasks"""
+    user_id = update.effective_user.id
+    tasks = await Storage.get_tasks(user_id)
+    
+    if not tasks:
+        await update.message.reply_text(
+            "📭 No tasks yet!\n\n"
+            "Add one with `/task Buy groceries`",
+            parse_mode="Markdown"
+        )
         return
-    task_id = int(context.args[0])
-    updated = storage.update_task_status(conn, task_id, "done")
-    if updated:
-        await update.message.reply_text(f"✅ Task #{task_id} marked as done!")
+    
+    # Group by status
+    todo = [t for t in tasks if t["status"] == "todo"]
+    doing = [t for t in tasks if t["status"] == "doing"]
+    done = [t for t in tasks if t["status"] == "done"]
+    
+    priority_emoji = {
+        "urgent": "🔴",
+        "high": "🟠",
+        "medium": "🟡",
+        "low": "🟢"
+    }
+    
+    text = "📋 **Your Tasks**\n\n"
+    
+    if todo:
+        text += "**📌 To Do:**\n"
+        for t in todo[:10]:
+            emoji = priority_emoji.get(t["priority"], "⚪")
+            text += f"{emoji} `{t['id']}` {t['title']}\n"
+        text += "\n"
+    
+    if doing:
+        text += "**⚡ In Progress:**\n"
+        for t in doing[:5]:
+            text += f"🔵 `{t['id']}` {t['title']}\n"
+        text += "\n"
+    
+    if done:
+        text += f"**✅ Done:** ({len(done)} tasks)\n"
+    
+    text += f"\n📊 Total: {len(tasks)} tasks"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark a task as done"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "Please provide task ID:\n"
+            "`/done 1`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid task ID")
+        return
+    
+    success = await Storage.complete_task(user_id, task_id)
+    
+    if success:
+        await update.message.reply_text(f"✅ Task #{task_id} completed! 🎉")
     else:
-        await update.message.reply_text(f"❌ Task #{task_id} not found.")
+        await update.message.reply_text(f"❌ Task #{task_id} not found")
 
 
-# ── /summary ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# REMINDER COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a reminder"""
     user_id = update.effective_user.id
-    messages = ctx_module.get_history(conn, user_id, limit=20)
-    mode = context.args[0] if context.args else "short"
-    summary = processor.summarise(messages, mode=mode)
-    await update.message.reply_text(f"📋 *Summary*\n\n{summary}", parse_mode=ParseMode.MARKDOWN)
-
-
-# ── /remind ───────────────────────────────────────────────────────────────────
-
-async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    user_id = update.effective_user.id
-    full_text = " ".join(context.args) if context.args else ""
-    if "|" not in full_text:
+    
+    if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /remind <time expression> | <message>\n"
-            "Example: /remind tomorrow at 9am | Call Alice"
+            "⏰ **How to set reminders:**\n\n"
+            "`/remind 30m Call mom`\n"
+            "`/remind 2h Meeting`\n"
+            "`/remind 1d Birthday`\n\n"
+            "Time formats: `m` (minutes), `h` (hours), `d` (days)",
+            parse_mode="Markdown"
         )
         return
-    time_part, _, message_part = full_text.partition("|")
-    reminder_id = reminder_module.schedule_reminder(
-        conn, user_id, message_part.strip(), time_part.strip()
-    )
-    if reminder_id:
-        remind_at = reminder_module.parse_reminder_time(time_part.strip())
+    
+    time_str = context.args[0].lower()
+    text = " ".join(context.args[1:])
+    
+    # Parse time
+    now = datetime.now()
+    remind_at = now
+    
+    try:
+        if time_str.endswith("m"):
+            minutes = int(time_str[:-1])
+            remind_at = now + timedelta(minutes=minutes)
+        elif time_str.endswith("h"):
+            hours = int(time_str[:-1])
+            remind_at = now + timedelta(hours=hours)
+        elif time_str.endswith("d"):
+            days = int(time_str[:-1])
+            remind_at = now + timedelta(days=days)
+        else:
+            raise ValueError("Invalid format")
+    except:
         await update.message.reply_text(
-            f"⏰ Reminder set for *{remind_at}*\nMessage: {message_part.strip()}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Could not parse the time. Try: /remind tomorrow at 9am | Call Alice"
-        )
-
-
-# ── /reminders ────────────────────────────────────────────────────────────────
-
-async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    user_id = update.effective_user.id
-    reminders = storage.get_user_reminders(conn, user_id)
-    text = reminder_module.format_reminder_list(reminders)
-    await update.message.reply_text(text)
-
-
-# ── /calendar ─────────────────────────────────────────────────────────────────
-
-async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    user_id = update.effective_user.id
-    events = calendar_integration.get_upcoming_events(conn, user_id, days=7)
-    text = calendar_integration.format_event_list(events)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-
-# ── /addevent ─────────────────────────────────────────────────────────────────
-
-async def cmd_addevent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
-    user_id = update.effective_user.id
-    full_text = " ".join(context.args) if context.args else ""
-    if " at " not in full_text.lower():
-        await update.message.reply_text(
-            "Usage: /addevent <title> at <datetime>\n"
-            "Example: /addevent Team standup at tomorrow 10am"
+            "❌ Invalid time format\n\n"
+            "Use: `30m`, `2h`, `1d`",
+            parse_mode="Markdown"
         )
         return
-
-    idx = full_text.lower().index(" at ")
-    title = full_text[:idx].strip()
-    time_text = full_text[idx + 4:].strip()
-    dt_str = processor.extract_datetime(time_text)
-    if not dt_str:
-        await update.message.reply_text("❌ Could not parse the date/time. Try: tomorrow at 10am")
-        return
-
-    from datetime import datetime
-    start_dt = datetime.fromisoformat(dt_str)
-    event = calendar_integration.add_event(conn, user_id, title=title, start_time=start_dt)
+    
+    reminder_id = await Storage.add_reminder(user_id, text, remind_at)
+    
     await update.message.reply_text(
-        f"📅 Event added:\n{calendar_integration.format_event(event)}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"⏰ **Reminder Set!**\n\n"
+        f"📝 {text}\n"
+        f"🕐 {remind_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"I'll remind you! 🔔",
+        parse_mode="Markdown"
     )
 
 
-# ── /exporttasks ──────────────────────────────────────────────────────────────
-
-async def cmd_exporttasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all reminders"""
     user_id = update.effective_user.id
-    tasks = storage.get_tasks(conn, user_id)
-    filepath = file_module.export_tasks_pdf(tasks)
-    with open(filepath, "rb") as fh:
-        await update.message.reply_document(document=fh, filename=filepath.name)
+    reminders = await Storage.get_reminders(user_id)
+    
+    if not reminders:
+        await update.message.reply_text(
+            "🔔 No active reminders\n\n"
+            "Set one with `/remind 30m Call mom`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    text = "⏰ **Your Reminders**\n\n"
+    for r in reminders:
+        text += f"🔔 `{r['id']}` {r['text']}\n"
+        text += f"   📅 {r['remind_at']}\n\n"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── /exportcal ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOTE COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_exportcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save a note"""
     user_id = update.effective_user.id
-    events = storage.get_events(conn, user_id)
-    filepath = calendar_integration.export_ical(events)
-    with open(filepath, "rb") as fh:
-        await update.message.reply_document(document=fh, filename=filepath.name)
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📝 Please provide note content:\n"
+            "`/note Meeting notes here`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    content = " ".join(context.args)
+    note_id = await Storage.add_note(user_id, content)
+    
+    await update.message.reply_text(
+        f"📝 **Note Saved!**\n\n"
+        f"ID: `{note_id}`\n"
+        f"Content: {content[:100]}{'...' if len(content) > 100 else ''}",
+        parse_mode="Markdown"
+    )
 
 
-# ── /status ───────────────────────────────────────────────────────────────────
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all notes"""
     user_id = update.effective_user.id
-    report = analytics.task_progress_report(conn, user_id)
-    await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+    notes = await Storage.get_notes(user_id)
+    
+    if not notes:
+        await update.message.reply_text(
+            "📝 No notes yet!\n\n"
+            "Save one with `/note Your note here`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    text = "📝 **Your Notes**\n\n"
+    for n in notes[:10]:
+        preview = n["content"][:50] + "..." if len(n["content"]) > 50 else n["content"]
+        text += f"`{n['id']}` {preview}\n"
+    
+    if len(notes) > 10:
+        text += f"\n... and {len(notes) - 10} more"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── /insights ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETTINGS COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_insights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show storage settings menu"""
     user_id = update.effective_user.id
-    text = analytics.recommendations(conn, user_id)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    settings = StorageSettings.get_settings(user_id)
+    current = settings.get("storage_type", "local")
+    
+    text = f"""
+⚙️ **Storage Settings**
+
+**Current:** {current.title()}
+
+Choose where to save your data:
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'✅ ' if current == 'local' else ''}📱 Bot Storage (Default)",
+            callback_data="storage:local"
+        )],
+        [InlineKeyboardButton(
+            f"{'✅ ' if current == 'airtable' else ''}📊 Airtable",
+            callback_data="storage:airtable"
+        )],
+        [InlineKeyboardButton(
+            f"{'✅ ' if current == 'sheets' else ''}📄 Google Sheets",
+            callback_data="storage:sheets"
+        )],
+        [InlineKeyboardButton("❌ Cancel", callback_data="storage:cancel")]
+    ]
+    
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 
-# ── /weekly ───────────────────────────────────────────────────────────────────
-
-async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = get_conn(context)
+async def storage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle storage selection"""
+    query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
-    text = analytics.weekly_summary(conn, user_id)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    choice = query.data.split(":")[1]
+    
+    if choice == "cancel":
+        await query.edit_message_text("Settings cancelled ❌")
+        return
+    
+    if choice == "local":
+        StorageSettings.reset_to_local(user_id)
+        await query.edit_message_text(
+            "✅ **Storage set to Bot Storage**\n\n"
+            "Your data is stored securely in the bot.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if choice == "airtable":
+        user_setup_state[user_id] = {"type": "airtable", "step": 1}
+        
+        await query.edit_message_text(
+            "📊 **Airtable Setup**\n\n"
+            "**Step 1/3:** Get your API Key\n\n"
+            "1. Go to airtable.com/account\n"
+            "2. Create a Personal Access Token\n"
+            "3. Give it read/write access\n\n"
+            "📝 **Send me your API Key:**\n"
+            "(or /cancel to go back)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if choice == "sheets":
+        user_setup_state[user_id] = {"type": "sheets", "step": 1}
+        
+        await query.edit_message_text(
+            "📄 **Google Sheets Setup**\n\n"
+            "1. Create a Google Sheet\n"
+            "2. Share it as 'Anyone with link can edit'\n"
+            "3. Copy the Sheet ID from URL:\n"
+            "   `docs.google.com/spreadsheets/d/`**SHEET_ID**`/edit`\n\n"
+            "📝 **Send me your Sheet ID:**\n"
+            "(or /cancel to go back)",
+            parse_mode="Markdown"
+        )
+        return
 
 
-# ── Free-form message handler ─────────────────────────────────────────────────
+async def handle_setup_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle input during storage setup"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    if text.lower() == "/cancel":
+        user_setup_state.pop(user_id, None)
+        await update.message.reply_text("Setup cancelled ❌\n\nUse /settings to try again.")
+        return
+    
+    if user_id not in user_setup_state:
+        return  # Not in setup mode
+    
+    state = user_setup_state[user_id]
+    
+    # ─── Airtable Setup ──────────────────────────────────────────────────────
+    if state["type"] == "airtable":
+        if state["step"] == 1:  # API Key
+            if not text.startswith(("pat", "key")):
+                await update.message.reply_text(
+                    "⚠️ That doesn't look like a valid API key.\n"
+                    "It should start with `pat` or `key`.\n\n"
+                    "Please try again or /cancel"
+                )
+                return
+            
+            state["api_key"] = text
+            state["step"] = 2
+            
+            await update.message.reply_text(
+                "✅ API Key received!\n\n"
+                "**Step 2/3:** Send me your **Base ID**\n"
+                "(starts with `app`, from the URL)",
+                parse_mode="Markdown"
+            )
+            return
+        
+        elif state["step"] == 2:  # Base ID
+            if not text.startswith("app"):
+                await update.message.reply_text(
+                    "⚠️ Base ID should start with `app`.\n\n"
+                    "Please try again or /cancel"
+                )
+                return
+            
+            state["base_id"] = text
+            state["step"] = 3
+            
+            await update.message.reply_text(
+                "✅ Base ID received!\n\n"
+                "**Step 3/3:** Send me your **Table Name**\n"
+                "(default: `Tasks`)",
+                parse_mode="Markdown"
+            )
+            return
+        
+        elif state["step"] == 3:  # Table Name
+            table_name = text or "Tasks"
+            
+            await update.message.reply_text("🔄 Testing connection...")
+            
+            client = AirtableClient(state["api_key"], state["base_id"], table_name)
+            result = await client.test_connection()
+            
+            if result["success"]:
+                StorageSettings.set_airtable(
+                    user_id, state["api_key"], state["base_id"], table_name
+                )
+                user_setup_state.pop(user_id, None)
+                
+                await update.message.reply_text(
+                    f"✅ **Airtable Connected!**\n\n"
+                    f"📊 Base: `{state['base_id']}`\n"
+                    f"📋 Table: `{table_name}`\n\n"
+                    f"Your data will now sync to Airtable! 🎉",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ **Connection Failed**\n\n"
+                    f"{result['message']}\n\n"
+                    f"Use /settings to try again."
+                )
+                user_setup_state.pop(user_id, None)
+            return
+    
+    # ─── Google Sheets Setup ─────────────────────────────────────────────────
+    elif state["type"] == "sheets":
+        # Extract ID if full URL provided
+        if "docs.google.com/spreadsheets" in text:
+            import re
+            match = re.search(r'/d/([a-zA-Z0-9-_]+)', text)
+            if match:
+                text = match.group(1)
+        
+        if len(text) < 20:
+            await update.message.reply_text(
+                "⚠️ Invalid Sheet ID.\n\n"
+                "Please try again or /cancel"
+            )
+            return
+        
+        await update.message.reply_text("🔄 Testing connection...")
+        
+        client = GoogleSheetsClient(text)
+        result = await client.test_connection()
+        
+        if result["success"]:
+            StorageSettings.set_google_sheets(user_id, text)
+            user_setup_state.pop(user_id, None)
+            
+            await update.message.reply_text(
+                f"✅ **Google Sheets Connected!**\n\n"
+                f"📄 Sheet ID: `{text[:20]}...`\n\n"
+                f"Your data will now sync to Google Sheets! 🎉",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ **Connection Failed**\n\n"
+                f"{result['message']}\n\n"
+                f"Use /settings to try again."
+            )
+            user_setup_state.pop(user_id, None)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Auto-process any free-form message:
-      1. Save to conversation history
-      2. Detect intent
-      3. Extract and save tasks
-      4. Detect and save reminders / calendar events
-      5. Reply with a structured confirmation
-    """
-    conn = get_conn(context)
+
+async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current storage configuration"""
+    user_id = update.effective_user.id
+    settings = StorageSettings.get_settings(user_id)
+    storage_type = settings.get("storage_type", "local")
+    
+    icons = {
+        "local": "📱",
+        "airtable": "📊",
+        "sheets": "📄",
+        "drive": "📁"
+    }
+    
+    text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
+    
+    if storage_type == "local":
+        text += "Data is stored in the bot's database."
+    elif storage_type == "airtable":
+        text += f"Base: `{settings.get('airtable_base_id', 'N/A')}`\n"
+        text += f"Table: `{settings.get('airtable_table_name', 'Tasks')}`"
+    elif storage_type == "sheets":
+        sheet_id = settings.get("google_sheet_id", "N/A")
+        text += f"Sheet: `{sheet_id[:20]}...`"
+    
+    text += "\n\n💡 Use /settings to change"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NATURAL LANGUAGE HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle natural language messages"""
     user_id = update.effective_user.id
     text = update.message.text
-
-    # 1. Persist
-    ctx_module.record_user_message(conn, user_id, text)
-
-    # 2. Intent
-    intent = processor.detect_intent(text)
-    ctx_module.set_last_intent(user_id, intent)
-
-    reply_parts: list[str] = []
-
-    # 3. Task extraction
-    new_tasks = task_module.extract_and_save_tasks(conn, user_id, text)
-    if new_tasks:
-        ctx_module.set_last_tasks(user_id, new_tasks)
-        task_lines = "\n".join(f"  • {t['title']}" for t in new_tasks)
-        reply_parts.append(f"📝 Extracted {len(new_tasks)} task(s):\n{task_lines}")
-
-    # 4. Reminder detection
-    if intent == "reminder":
-        dt_str = processor.extract_datetime(text)
-        if dt_str:
-            reminder_id = reminder_module.schedule_reminder(
-                conn, user_id, message=text, time_expression=text
-            )
-            if reminder_id:
-                reply_parts.append(f"⏰ Reminder set for {dt_str}")
-
-    # 5. Calendar event detection
-    if intent == "calendar":
-        dt_str = processor.extract_datetime(text)
-        if dt_str:
-            from datetime import datetime
-            try:
-                start_dt = datetime.fromisoformat(dt_str)
-                event = calendar_integration.add_event(
-                    conn, user_id, title=text[:60], start_time=start_dt
-                )
-                reply_parts.append(f"📅 Calendar event created: {event['title']}")
-            except Exception as exc:
-                logger.debug("Could not create calendar event: %s", exc)
-
-    # Fallback reply
-    if not reply_parts:
-        reply_parts.append(
-            "Got it! Send /tasks to see your task list or /help for all commands."
+    
+    # Check if in setup mode
+    if user_id in user_setup_state:
+        await handle_setup_input(update, context)
+        return
+    
+    # Simple intent detection
+    text_lower = text.lower()
+    
+    # Reminder patterns
+    if any(word in text_lower for word in ["remind", "เตือน", "reminder"]):
+        # Try to parse with AI or simple patterns
+        await update.message.reply_text(
+            "⏰ To set a reminder, use:\n"
+            "`/remind 30m <your reminder>`\n\n"
+            "Examples:\n"
+            "• `/remind 1h Call client`\n"
+            "• `/remind 2d Birthday party`",
+            parse_mode="Markdown"
         )
-
-    reply = "\n\n".join(reply_parts)
-    ctx_module.record_assistant_reply(conn, user_id, reply)
-    await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-
-
-# ── Bot bootstrap ─────────────────────────────────────────────────────────────
-
-def build_app() -> Application:
-    """Build and configure the Telegram Application."""
-    app = (
-        Application.builder()
-        .token(config.TELEGRAM_BOT_TOKEN)
-        .build()
+        return
+    
+    # Task patterns
+    if any(word in text_lower for word in ["task", "todo", "add", "งาน", "เพิ่ม"]):
+        # Extract task from message
+        context.args = text.split()[1:] if len(text.split()) > 1 else []
+        if context.args:
+            await task_command(update, context)
+        else:
+            await update.message.reply_text(
+                "📝 To add a task, use:\n"
+                "`/task <task description>`",
+                parse_mode="Markdown"
+            )
+        return
+    
+    # Default response
+    await update.message.reply_text(
+        "🤖 I'm not sure what you need.\n\n"
+        "Try these commands:\n"
+        "• `/task <title>` - Add task\n"
+        "• `/remind 30m <text>` - Set reminder\n"
+        "• `/note <content>` - Save note\n"
+        "• `/help` - Full guide",
+        parse_mode="Markdown"
     )
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("tasks", cmd_tasks))
-    app.add_handler(CommandHandler("addtask", cmd_addtask))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("summary", cmd_summary))
-    app.add_handler(CommandHandler("remind", cmd_remind))
-    app.add_handler(CommandHandler("reminders", cmd_reminders))
-    app.add_handler(CommandHandler("calendar", cmd_calendar))
-    app.add_handler(CommandHandler("addevent", cmd_addevent))
-    app.add_handler(CommandHandler("exporttasks", cmd_exporttasks))
-    app.add_handler(CommandHandler("exportcal", cmd_exportcal))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("insights", cmd_insights))
-    app.add_handler(CommandHandler("weekly", cmd_weekly))
 
-    # Free-form messages
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    """Start the bot"""
+    # Initialize database
+    init_db()
+    
+    # Create application
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    
+    # Task commands
+    app.add_handler(CommandHandler("task", task_command))
+    app.add_handler(CommandHandler("tasks", tasks_command))
+    app.add_handler(CommandHandler("done", done_command))
+    
+    # Reminder commands
+    app.add_handler(CommandHandler("remind", remind_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
+    
+    # Note commands
+    app.add_handler(CommandHandler("note", note_command))
+    app.add_handler(CommandHandler("notes", notes_command))
+    
+    # Settings commands
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("mystorage", mystorage_command))
+    app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))
+    
+    # Natural language handler (must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    return app
-
-
-def main() -> None:
-    if not config.TELEGRAM_BOT_TOKEN:
-        logger.error(
-            "TELEGRAM_BOT_TOKEN is not set. "
-            "Copy .env.example to .env and fill in your credentials."
-        )
-        sys.exit(1)
-
-    app = build_app()
-
-    # Wire up reminder service
-    conn = storage.init_db()
-    app.bot_data["db_conn"] = conn
-
-    async def send_reminder(user_id: int, message: str) -> None:
-        await app.bot.send_message(chat_id=user_id, text=message)
-
-    reminder_svc = reminder_module.ReminderService(conn, send_reminder)
-
-    async def on_startup(application: Application) -> None:
-        reminder_svc.start()
-
-    async def on_shutdown(application: Application) -> None:
-        reminder_svc.stop()
-
-    app.post_init = on_startup
-    app.post_shutdown = on_shutdown
-
-    logger.info("Starting AI Personal Assistant Bot …")
+    
+    # Start scheduler for reminders
+    scheduler = AsyncIOScheduler()
+    # Add reminder check job here if needed
+    scheduler.start()
+    
+    # Start polling
+    logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
