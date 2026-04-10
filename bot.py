@@ -1,21 +1,23 @@
 """
-Assistant_everyTask_Bot - With User Storage Settings
-Users can connect their own Airtable, Google Sheets, or Google Drive!
+Assistant_everyTask_Bot - Enhanced Version
+Features: Tasks, Reminders, Notes, Storage Settings, Translation, Voice Transcription
 """
-# Force redeploy v2
+
 import os
 import sqlite3
 import logging
 import json
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Voice, File
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
+    filters, ContextTypes
 )
-import openai
+from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiohttp
 
@@ -38,13 +40,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# OpenAI setup
+# OpenAI client
+client = None
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Conversation states for settings
-(AWAITING_STORAGE_CHOICE, AWAITING_AIRTABLE_KEY, AWAITING_AIRTABLE_BASE, 
- AWAITING_AIRTABLE_TABLE, AWAITING_SHEETS_ID) = range(5)
+# Supported languages for translation
+LANGUAGES = {
+    "en": "English", "th": "ไทย", "zh": "中文", "ja": "日本語", "ko": "한국어",
+    "vi": "Tiếng Việt", "id": "Bahasa Indonesia", "ms": "Bahasa Melayu",
+    "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
+    "pt": "Português", "ru": "Русский", "ar": "العربية", "hi": "हिंदी",
+    "tl": "Tagalog", "my": "မြန်မာ", "km": "ខ្មែរ", "lo": "ລາວ"
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -94,20 +102,6 @@ def init_db():
         )
     """)
     
-    # Calendar events table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            start_time TIMESTAMP NOT NULL,
-            end_time TIMESTAMP,
-            location TEXT,
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
     # User storage settings table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_storage_settings (
@@ -117,9 +111,20 @@ def init_db():
             airtable_base_id TEXT,
             airtable_table_name TEXT DEFAULT 'Tasks',
             google_sheet_id TEXT,
-            google_drive_folder_id TEXT,
+            preferred_language TEXT DEFAULT 'en',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Voice transcriptions log
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transcriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            original_text TEXT,
+            duration_seconds REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
@@ -141,7 +146,7 @@ class StorageSettings:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT storage_type, airtable_api_key, airtable_base_id, 
-                   airtable_table_name, google_sheet_id
+                   airtable_table_name, google_sheet_id, preferred_language
             FROM user_storage_settings WHERE user_id = ?
         """, (user_id,))
         row = cursor.fetchone()
@@ -153,9 +158,10 @@ class StorageSettings:
                 "airtable_api_key": row[1],
                 "airtable_base_id": row[2],
                 "airtable_table_name": row[3] or "Tasks",
-                "google_sheet_id": row[4]
+                "google_sheet_id": row[4],
+                "preferred_language": row[5] or "en"
             }
-        return {"storage_type": "local"}
+        return {"storage_type": "local", "preferred_language": "en"}
     
     @staticmethod
     def set_storage_type(user_id: int, storage_type: str):
@@ -206,6 +212,20 @@ class StorageSettings:
         conn.close()
     
     @staticmethod
+    def set_language(user_id: int, lang_code: str):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings (user_id, preferred_language, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET 
+                preferred_language = excluded.preferred_language,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, lang_code))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
     def reset_to_local(user_id: int):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -245,7 +265,6 @@ class AirtableClient:
         return f"{self.BASE_URL}/{self.base_id}/{self.table_name}"
     
     async def test_connection(self) -> Dict[str, Any]:
-        """Test if connection works"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -261,52 +280,6 @@ class AirtableClient:
                         return {"success": False, "message": f"❌ Error: {response.status}"}
         except Exception as e:
             return {"success": False, "message": f"❌ Error: {str(e)}"}
-    
-    async def add_task(self, user_id: int, title: str, priority: str = "medium",
-                       due_date: str = None) -> bool:
-        """Add a task to Airtable"""
-        fields = {
-            "Title": title,
-            "User ID": str(user_id),
-            "Priority": priority,
-            "Status": "todo",
-            "Created": datetime.now().isoformat()
-        }
-        if due_date:
-            fields["Due Date"] = due_date
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.url, headers=self.headers, json={"fields": fields}
-                ) as response:
-                    return response.status == 200
-        except:
-            return False
-    
-    async def get_tasks(self, user_id: int) -> List[Dict]:
-        """Get tasks from Airtable"""
-        try:
-            params = {"filterByFormula": f"{{User ID}} = '{user_id}'"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    self.url, headers=self.headers, params=params
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return [
-                            {
-                                "id": r["id"],
-                                "title": r["fields"].get("Title", ""),
-                                "priority": r["fields"].get("Priority", "medium"),
-                                "status": r["fields"].get("Status", "todo"),
-                                "due_date": r["fields"].get("Due Date")
-                            }
-                            for r in data.get("records", [])
-                        ]
-            return []
-        except:
-            return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -316,15 +289,11 @@ class AirtableClient:
 class GoogleSheetsClient:
     """Simple Google Sheets client (public sheets only)"""
     
-    API_URL = "https://sheets.googleapis.com/v4/spreadsheets"
-    
     def __init__(self, sheet_id: str):
         self.sheet_id = sheet_id
     
     async def test_connection(self) -> Dict[str, Any]:
-        """Test if the sheet is accessible"""
         try:
-            # For public sheets, we can test with export URL
             url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/export?format=csv&range=A1"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
@@ -337,42 +306,15 @@ class GoogleSheetsClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UNIFIED STORAGE MANAGER
+# STORAGE MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Storage:
     """Routes storage operations to the correct backend"""
     
     @staticmethod
-    def _get_backend(user_id: int):
-        settings = StorageSettings.get_settings(user_id)
-        storage_type = settings.get("storage_type", "local")
-        
-        if storage_type == "airtable" and settings.get("airtable_api_key"):
-            return AirtableClient(
-                settings["airtable_api_key"],
-                settings["airtable_base_id"],
-                settings.get("airtable_table_name", "Tasks")
-            )
-        elif storage_type == "sheets" and settings.get("google_sheet_id"):
-            return GoogleSheetsClient(settings["google_sheet_id"])
-        
-        return None  # Use local SQLite
-    
-    # ─── Task Operations ─────────────────────────────────────────────────────
-    
-    @staticmethod
     async def add_task(user_id: int, title: str, priority: str = "medium",
                        due_date: str = None, project: str = None) -> int:
-        """Add a task - routes to correct backend"""
-        backend = Storage._get_backend(user_id)
-        
-        if isinstance(backend, AirtableClient):
-            success = await backend.add_task(user_id, title, priority, due_date)
-            if success:
-                return 1  # Return dummy ID for external storage
-        
-        # Default: local SQLite
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
@@ -386,13 +328,6 @@ class Storage:
     
     @staticmethod
     async def get_tasks(user_id: int, status: str = None) -> List[Dict]:
-        """Get tasks - routes to correct backend"""
-        backend = Storage._get_backend(user_id)
-        
-        if isinstance(backend, AirtableClient):
-            return await backend.get_tasks(user_id)
-        
-        # Default: local SQLite
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
@@ -414,20 +349,14 @@ class Storage:
         
         return [
             {
-                "id": row[0],
-                "title": row[1],
-                "priority": row[2],
-                "status": row[3],
-                "due_date": row[4],
-                "project": row[5],
-                "created_at": row[6]
+                "id": row[0], "title": row[1], "priority": row[2],
+                "status": row[3], "due_date": row[4], "project": row[5]
             }
             for row in rows
         ]
     
     @staticmethod
     async def complete_task(user_id: int, task_id: int) -> bool:
-        """Mark task as complete"""
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
@@ -438,8 +367,6 @@ class Storage:
         conn.commit()
         conn.close()
         return affected > 0
-    
-    # ─── Reminder Operations ─────────────────────────────────────────────────
     
     @staticmethod
     async def add_reminder(user_id: int, text: str, remind_at: datetime) -> int:
@@ -467,8 +394,6 @@ class Storage:
         conn.close()
         return [{"id": r[0], "text": r[1], "remind_at": r[2], "status": r[3]} for r in rows]
     
-    # ─── Note Operations ─────────────────────────────────────────────────────
-    
     @staticmethod
     async def add_note(user_id: int, content: str, tags: str = None) -> int:
         conn = sqlite3.connect(DB_PATH)
@@ -483,24 +408,66 @@ class Storage:
         return note_id
     
     @staticmethod
-    async def get_notes(user_id: int, search: str = None) -> List[Dict]:
+    async def get_notes(user_id: int) -> List[Dict]:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        if search:
-            cursor.execute("""
-                SELECT id, content, tags, created_at
-                FROM notes WHERE user_id = ? AND content LIKE ?
-                ORDER BY created_at DESC
-            """, (user_id, f"%{search}%"))
-        else:
-            cursor.execute("""
-                SELECT id, content, tags, created_at
-                FROM notes WHERE user_id = ?
-                ORDER BY created_at DESC
-            """, (user_id,))
+        cursor.execute("""
+            SELECT id, content, tags, created_at
+            FROM notes WHERE user_id = ?
+            ORDER BY created_at DESC
+        """, (user_id,))
         rows = cursor.fetchall()
         conn.close()
         return [{"id": r[0], "content": r[1], "tags": r[2], "created_at": r[3]} for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI SERVICES (Translation & Transcription)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def translate_text(text: str, target_lang: str, source_lang: str = "auto") -> str:
+    """Translate text using OpenAI GPT"""
+    if not client:
+        return "❌ OpenAI API not configured"
+    
+    try:
+        lang_name = LANGUAGES.get(target_lang, target_lang)
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a translator. Translate the following text to {lang_name}. Only output the translation, nothing else."
+                },
+                {"role": "user", "content": text}
+            ],
+            max_tokens=1000
+        )
+        
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return f"❌ Translation error: {str(e)}"
+
+
+async def transcribe_voice(file_path: str) -> str:
+    """Transcribe voice message using OpenAI Whisper"""
+    if not client:
+        return "❌ OpenAI API not configured"
+    
+    try:
+        with open(file_path, "rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+        
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return f"❌ Transcription error: {str(e)}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -519,31 +486,49 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
     text = f"""
-👋 **สวัสดี {user.first_name}!** / Hello!
+👋 **สวัสดี {user.first_name}!** Welcome!
 
-ฉันคือ **Assistant Bot** ผู้ช่วยจัดการงานส่วนตัวของคุณ!
+🤖 I'm **Assistant EveryTask Bot** - Your personal productivity assistant!
 
-🇹🇭 **คำสั่งภาษาไทย:**
-• `/task ซื้อของ` - เพิ่มงาน
-• `/remind 30m โทรหาลูกค้า` - ตั้งเตือน
-• `/note บันทึกสำคัญ` - จดโน้ต
-
-🇬🇧 **English Commands:**
-• `/task Buy groceries` - Add task
-• `/remind 1h Call client` - Set reminder  
-• `/note Important meeting points` - Save note
-
-⚙️ **Storage Settings:**
-• `/settings` - Connect your own Airtable, Google Sheets, or Drive!
-
-📋 **More Commands:**
+━━━━━━━━━━━━━━━━━━━━
+📋 **Task Management**
+━━━━━━━━━━━━━━━━━━━━
+• `/task <title>` - Add a task
 • `/tasks` - View all tasks
-• `/done 1` - Complete task #1
-• `/reminders` - View reminders
-• `/notes` - View notes
-• `/help` - Full help
+• `/done <id>` - Complete task
 
-💡 Or just type naturally: "remind me to call mom in 2 hours"
+━━━━━━━━━━━━━━━━━━━━
+⏰ **Reminders**
+━━━━━━━━━━━━━━━━━━━━
+• `/remind 30m Call mom`
+• `/reminders` - View all
+
+━━━━━━━━━━━━━━━━━━━━
+📝 **Notes**
+━━━━━━━━━━━━━━━━━━━━
+• `/note <content>` - Save note
+• `/notes` - View all notes
+
+━━━━━━━━━━━━━━━━━━━━
+🌐 **Translation**
+━━━━━━━━━━━━━━━━━━━━
+• `/tr <lang> <text>` - Translate
+• Example: `/tr th Hello world`
+• Supports 20+ languages!
+
+━━━━━━━━━━━━━━━━━━━━
+🎤 **Voice Messages**
+━━━━━━━━━━━━━━━━━━━━
+• Just send a voice message!
+• I'll transcribe it automatically 🎙️
+
+━━━━━━━━━━━━━━━━━━━━
+⚙️ **Settings**
+━━━━━━━━━━━━━━━━━━━━
+• `/settings` - Storage options
+• `/language` - Set language
+
+Use `/help` for full guide! 📖
 """
     
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -552,44 +537,37 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
     text = """
-📖 **คู่มือการใช้งาน / User Guide**
+📖 **Full Command Guide**
 
-━━━━━━━━━━━━━━━━━━━━
-✅ **Tasks / งาน**
-━━━━━━━━━━━━━━━━━━━━
-`/task <title>` - เพิ่มงาน / Add task
-`/tasks` - ดูรายการงาน / List tasks
-`/done <id>` - เสร็จงาน / Complete task
-`/delete <id>` - ลบงาน / Delete task
+**Tasks:**
+`/task Buy groceries` - Add task
+`/tasks` - List all tasks
+`/done 1` - Complete task #1
 
-━━━━━━━━━━━━━━━━━━━━
-⏰ **Reminders / เตือนความจำ**
-━━━━━━━━━━━━━━━━━━━━
-`/remind <time> <text>` - ตั้งเตือน
-Examples:
-• `/remind 30m call mom`
-• `/remind 2h meeting`
-• `/remind 1d birthday`
+**Reminders:**
+`/remind 30m Call client`
+`/remind 2h Meeting`
+`/remind 1d Birthday`
+`/reminders` - View active
 
-━━━━━━━━━━━━━━━━━━━━
-📝 **Notes / บันทึก**
-━━━━━━━━━━━━━━━━━━━━
-`/note <content>` - บันทึกโน้ต
-`/notes` - ดูโน้ตทั้งหมด
-`/search <keyword>` - ค้นหาโน้ต
+**Notes:**
+`/note Meeting notes here`
+`/notes` - View all notes
 
-━━━━━━━━━━━━━━━━━━━━
-⚙️ **Settings / ตั้งค่า**
-━━━━━━━━━━━━━━━━━━━━
-`/settings` - เชื่อมต่อ Airtable/Sheets
-`/mystorage` - ดูการตั้งค่าปัจจุบัน
+**Translation:**
+`/tr th Hello` → สวัสดี
+`/tr en สวัสดี` → Hello
+`/tr ja Good morning` → おはよう
 
-━━━━━━━━━━━━━━━━━━━━
-🤖 **AI / ฉลาด**
-━━━━━━━━━━━━━━━━━━━━
-Just type naturally!
-• "remind me to buy milk tomorrow"
-• "add task call client urgent"
+**Languages:** en, th, zh, ja, ko, vi, id, ms, es, fr, de, it, pt, ru, ar, hi, tl, my, km, lo
+
+**Voice:**
+Send any voice message → Auto transcription!
+
+**Settings:**
+`/settings` - Connect Airtable/Sheets
+`/mystorage` - View current storage
+`/language` - Set preferred language
 """
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -604,18 +582,17 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not context.args:
         await update.message.reply_text(
-            "📝 Please provide a task title:\n"
-            "`/task Buy groceries`",
+            "📝 Please provide a task title:\n`/task Buy groceries`",
             parse_mode="Markdown"
         )
         return
     
     title = " ".join(context.args)
     
-    # Detect priority from text
+    # Detect priority
     priority = "medium"
     title_lower = title.lower()
-    if any(w in title_lower for w in ["urgent", "ด่วน", "asap"]):
+    if any(w in title_lower for w in ["urgent", "ด่วน", "asap", "!"]):
         priority = "urgent"
     elif any(w in title_lower for w in ["important", "สำคัญ", "high"]):
         priority = "high"
@@ -624,20 +601,13 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     task_id = await Storage.add_task(user_id, title, priority)
     
-    settings = StorageSettings.get_settings(user_id)
-    storage_icon = {
-        "local": "📱",
-        "airtable": "📊",
-        "sheets": "📄",
-        "drive": "📁"
-    }.get(settings.get("storage_type", "local"), "📱")
+    priority_emoji = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
     
     await update.message.reply_text(
         f"✅ **Task Added!**\n\n"
         f"📋 {title}\n"
-        f"🔴 Priority: {priority}\n"
-        f"{storage_icon} Storage: {settings.get('storage_type', 'local').title()}\n\n"
-        f"Use `/done {task_id}` to complete",
+        f"{priority_emoji.get(priority, '⚪')} Priority: {priority}\n\n"
+        f"Complete with `/done {task_id}`",
         parse_mode="Markdown"
     )
 
@@ -649,23 +619,16 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not tasks:
         await update.message.reply_text(
-            "📭 No tasks yet!\n\n"
-            "Add one with `/task Buy groceries`",
+            "📭 No tasks yet!\nAdd one with `/task Buy groceries`",
             parse_mode="Markdown"
         )
         return
     
-    # Group by status
     todo = [t for t in tasks if t["status"] == "todo"]
     doing = [t for t in tasks if t["status"] == "doing"]
     done = [t for t in tasks if t["status"] == "done"]
     
-    priority_emoji = {
-        "urgent": "🔴",
-        "high": "🟠",
-        "medium": "🟡",
-        "low": "🟢"
-    }
+    priority_emoji = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
     
     text = "📋 **Your Tasks**\n\n"
     
@@ -683,9 +646,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n"
     
     if done:
-        text += f"**✅ Done:** ({len(done)} tasks)\n"
-    
-    text += f"\n📊 Total: {len(tasks)} tasks"
+        text += f"**✅ Done:** {len(done)} tasks\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -695,11 +656,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if not context.args:
-        await update.message.reply_text(
-            "Please provide task ID:\n"
-            "`/done 1`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/done 1`", parse_mode="Markdown")
         return
     
     try:
@@ -726,11 +683,10 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⏰ **How to set reminders:**\n\n"
+            "⏰ **Set a reminder:**\n\n"
             "`/remind 30m Call mom`\n"
             "`/remind 2h Meeting`\n"
-            "`/remind 1d Birthday`\n\n"
-            "Time formats: `m` (minutes), `h` (hours), `d` (days)",
+            "`/remind 1d Birthday`",
             parse_mode="Markdown"
         )
         return
@@ -738,58 +694,44 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = context.args[0].lower()
     text = " ".join(context.args[1:])
     
-    # Parse time
     now = datetime.now()
     remind_at = now
     
     try:
         if time_str.endswith("m"):
-            minutes = int(time_str[:-1])
-            remind_at = now + timedelta(minutes=minutes)
+            remind_at = now + timedelta(minutes=int(time_str[:-1]))
         elif time_str.endswith("h"):
-            hours = int(time_str[:-1])
-            remind_at = now + timedelta(hours=hours)
+            remind_at = now + timedelta(hours=int(time_str[:-1]))
         elif time_str.endswith("d"):
-            days = int(time_str[:-1])
-            remind_at = now + timedelta(days=days)
+            remind_at = now + timedelta(days=int(time_str[:-1]))
         else:
             raise ValueError("Invalid format")
     except:
-        await update.message.reply_text(
-            "❌ Invalid time format\n\n"
-            "Use: `30m`, `2h`, `1d`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ Use: `30m`, `2h`, `1d`", parse_mode="Markdown")
         return
     
-    reminder_id = await Storage.add_reminder(user_id, text, remind_at)
+    await Storage.add_reminder(user_id, text, remind_at)
     
     await update.message.reply_text(
         f"⏰ **Reminder Set!**\n\n"
         f"📝 {text}\n"
-        f"🕐 {remind_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"I'll remind you! 🔔",
+        f"🕐 {remind_at.strftime('%Y-%m-%d %H:%M')}",
         parse_mode="Markdown"
     )
 
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all reminders"""
+    """List reminders"""
     user_id = update.effective_user.id
     reminders = await Storage.get_reminders(user_id)
     
     if not reminders:
-        await update.message.reply_text(
-            "🔔 No active reminders\n\n"
-            "Set one with `/remind 30m Call mom`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🔔 No active reminders")
         return
     
     text = "⏰ **Your Reminders**\n\n"
     for r in reminders:
-        text += f"🔔 `{r['id']}` {r['text']}\n"
-        text += f"   📅 {r['remind_at']}\n\n"
+        text += f"🔔 `{r['id']}` {r['text']}\n   📅 {r['remind_at']}\n\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -803,35 +745,25 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if not context.args:
-        await update.message.reply_text(
-            "📝 Please provide note content:\n"
-            "`/note Meeting notes here`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("📝 Usage: `/note Your note here`", parse_mode="Markdown")
         return
     
     content = " ".join(context.args)
     note_id = await Storage.add_note(user_id, content)
     
     await update.message.reply_text(
-        f"📝 **Note Saved!**\n\n"
-        f"ID: `{note_id}`\n"
-        f"Content: {content[:100]}{'...' if len(content) > 100 else ''}",
+        f"📝 **Note Saved!**\n\nID: `{note_id}`",
         parse_mode="Markdown"
     )
 
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all notes"""
+    """List notes"""
     user_id = update.effective_user.id
     notes = await Storage.get_notes(user_id)
     
     if not notes:
-        await update.message.reply_text(
-            "📝 No notes yet!\n\n"
-            "Save one with `/note Your note here`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("📝 No notes yet!")
         return
     
     text = "📝 **Your Notes**\n\n"
@@ -839,10 +771,101 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = n["content"][:50] + "..." if len(n["content"]) > 50 else n["content"]
         text += f"`{n['id']}` {preview}\n"
     
-    if len(notes) > 10:
-        text += f"\n... and {len(notes) - 10} more"
-    
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRANSLATION COMMAND
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Translate text"""
+    if len(context.args) < 2:
+        lang_list = ", ".join([f"`{k}` ({v})" for k, v in list(LANGUAGES.items())[:10]])
+        await update.message.reply_text(
+            f"🌐 **Translation**\n\n"
+            f"Usage: `/tr <lang> <text>`\n\n"
+            f"Example:\n"
+            f"• `/tr th Hello world`\n"
+            f"• `/tr en สวัสดี`\n"
+            f"• `/tr ja Good morning`\n\n"
+            f"**Languages:**\n{lang_list}...",
+            parse_mode="Markdown"
+        )
+        return
+    
+    target_lang = context.args[0].lower()
+    text = " ".join(context.args[1:])
+    
+    if target_lang not in LANGUAGES:
+        await update.message.reply_text(
+            f"❌ Unknown language: `{target_lang}`\n\n"
+            f"Available: en, th, zh, ja, ko, vi, id, es, fr, de...",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await update.message.reply_text("🔄 Translating...")
+    
+    translated = await translate_text(text, target_lang)
+    
+    await update.message.reply_text(
+        f"🌐 **Translation**\n\n"
+        f"📝 Original: {text}\n\n"
+        f"🎯 {LANGUAGES[target_lang]}: {translated}",
+        parse_mode="Markdown"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VOICE MESSAGE HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages - transcribe them"""
+    user_id = update.effective_user.id
+    voice = update.message.voice
+    
+    if not voice:
+        return
+    
+    await update.message.reply_text("🎤 Transcribing your voice message...")
+    
+    try:
+        # Download the voice file
+        file: File = await context.bot.get_file(voice.file_id)
+        
+        # Create temp file
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_file:
+            temp_path = temp_file.name
+            await file.download_to_drive(temp_path)
+        
+        # Transcribe
+        transcription = await transcribe_voice(temp_path)
+        
+        # Clean up
+        os.unlink(temp_path)
+        
+        # Save to database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO transcriptions (user_id, original_text, duration_seconds)
+            VALUES (?, ?, ?)
+        """, (user_id, transcription, voice.duration))
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(
+            f"🎤 **Voice Transcription**\n\n"
+            f"📝 {transcription}\n\n"
+            f"⏱️ Duration: {voice.duration}s",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Voice handling error: {e}")
+        await update.message.reply_text(f"❌ Could not transcribe: {str(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -854,14 +877,6 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     settings = StorageSettings.get_settings(user_id)
     current = settings.get("storage_type", "local")
-    
-    text = f"""
-⚙️ **Storage Settings**
-
-**Current:** {current.title()}
-
-Choose where to save your data:
-"""
     
     keyboard = [
         [InlineKeyboardButton(
@@ -880,7 +895,7 @@ Choose where to save your data:
     ]
     
     await update.message.reply_text(
-        text,
+        f"⚙️ **Storage Settings**\n\n**Current:** {current.title()}",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -900,168 +915,29 @@ async def storage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if choice == "local":
         StorageSettings.reset_to_local(user_id)
-        await query.edit_message_text(
-            "✅ **Storage set to Bot Storage**\n\n"
-            "Your data is stored securely in the bot.",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("✅ **Storage set to Bot Storage**", parse_mode="Markdown")
         return
     
     if choice == "airtable":
         user_setup_state[user_id] = {"type": "airtable", "step": 1}
-        
         await query.edit_message_text(
             "📊 **Airtable Setup**\n\n"
-            "**Step 1/3:** Get your API Key\n\n"
-            "1. Go to airtable.com/account\n"
-            "2. Create a Personal Access Token\n"
-            "3. Give it read/write access\n\n"
-            "📝 **Send me your API Key:**\n"
-            "(or /cancel to go back)",
+            "**Step 1/3:** Send me your **API Key**\n"
+            "(starts with `pat` or `key`)\n\n"
+            "Or /cancel to go back",
             parse_mode="Markdown"
         )
         return
     
     if choice == "sheets":
         user_setup_state[user_id] = {"type": "sheets", "step": 1}
-        
         await query.edit_message_text(
             "📄 **Google Sheets Setup**\n\n"
-            "1. Create a Google Sheet\n"
-            "2. Share it as 'Anyone with link can edit'\n"
-            "3. Copy the Sheet ID from URL:\n"
-            "   `docs.google.com/spreadsheets/d/`**SHEET_ID**`/edit`\n\n"
-            "📝 **Send me your Sheet ID:**\n"
-            "(or /cancel to go back)",
+            "Send me your **Sheet ID** from the URL\n\n"
+            "Or /cancel to go back",
             parse_mode="Markdown"
         )
         return
-
-
-async def handle_setup_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle input during storage setup"""
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if text.lower() == "/cancel":
-        user_setup_state.pop(user_id, None)
-        await update.message.reply_text("Setup cancelled ❌\n\nUse /settings to try again.")
-        return
-    
-    if user_id not in user_setup_state:
-        return  # Not in setup mode
-    
-    state = user_setup_state[user_id]
-    
-    # ─── Airtable Setup ──────────────────────────────────────────────────────
-    if state["type"] == "airtable":
-        if state["step"] == 1:  # API Key
-            if not text.startswith(("pat", "key")):
-                await update.message.reply_text(
-                    "⚠️ That doesn't look like a valid API key.\n"
-                    "It should start with `pat` or `key`.\n\n"
-                    "Please try again or /cancel"
-                )
-                return
-            
-            state["api_key"] = text
-            state["step"] = 2
-            
-            await update.message.reply_text(
-                "✅ API Key received!\n\n"
-                "**Step 2/3:** Send me your **Base ID**\n"
-                "(starts with `app`, from the URL)",
-                parse_mode="Markdown"
-            )
-            return
-        
-        elif state["step"] == 2:  # Base ID
-            if not text.startswith("app"):
-                await update.message.reply_text(
-                    "⚠️ Base ID should start with `app`.\n\n"
-                    "Please try again or /cancel"
-                )
-                return
-            
-            state["base_id"] = text
-            state["step"] = 3
-            
-            await update.message.reply_text(
-                "✅ Base ID received!\n\n"
-                "**Step 3/3:** Send me your **Table Name**\n"
-                "(default: `Tasks`)",
-                parse_mode="Markdown"
-            )
-            return
-        
-        elif state["step"] == 3:  # Table Name
-            table_name = text or "Tasks"
-            
-            await update.message.reply_text("🔄 Testing connection...")
-            
-            client = AirtableClient(state["api_key"], state["base_id"], table_name)
-            result = await client.test_connection()
-            
-            if result["success"]:
-                StorageSettings.set_airtable(
-                    user_id, state["api_key"], state["base_id"], table_name
-                )
-                user_setup_state.pop(user_id, None)
-                
-                await update.message.reply_text(
-                    f"✅ **Airtable Connected!**\n\n"
-                    f"📊 Base: `{state['base_id']}`\n"
-                    f"📋 Table: `{table_name}`\n\n"
-                    f"Your data will now sync to Airtable! 🎉",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ **Connection Failed**\n\n"
-                    f"{result['message']}\n\n"
-                    f"Use /settings to try again."
-                )
-                user_setup_state.pop(user_id, None)
-            return
-    
-    # ─── Google Sheets Setup ─────────────────────────────────────────────────
-    elif state["type"] == "sheets":
-        # Extract ID if full URL provided
-        if "docs.google.com/spreadsheets" in text:
-            import re
-            match = re.search(r'/d/([a-zA-Z0-9-_]+)', text)
-            if match:
-                text = match.group(1)
-        
-        if len(text) < 20:
-            await update.message.reply_text(
-                "⚠️ Invalid Sheet ID.\n\n"
-                "Please try again or /cancel"
-            )
-            return
-        
-        await update.message.reply_text("🔄 Testing connection...")
-        
-        client = GoogleSheetsClient(text)
-        result = await client.test_connection()
-        
-        if result["success"]:
-            StorageSettings.set_google_sheets(user_id, text)
-            user_setup_state.pop(user_id, None)
-            
-            await update.message.reply_text(
-                f"✅ **Google Sheets Connected!**\n\n"
-                f"📄 Sheet ID: `{text[:20]}...`\n\n"
-                f"Your data will now sync to Google Sheets! 🎉",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ **Connection Failed**\n\n"
-                f"{result['message']}\n\n"
-                f"Use /settings to try again."
-            )
-            user_setup_state.pop(user_id, None)
 
 
 async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1070,81 +946,133 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = StorageSettings.get_settings(user_id)
     storage_type = settings.get("storage_type", "local")
     
-    icons = {
-        "local": "📱",
-        "airtable": "📊",
-        "sheets": "📄",
-        "drive": "📁"
-    }
+    icons = {"local": "📱", "airtable": "📊", "sheets": "📄"}
     
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
-    if storage_type == "local":
-        text += "Data is stored in the bot's database."
-    elif storage_type == "airtable":
-        text += f"Base: `{settings.get('airtable_base_id', 'N/A')}`\n"
-        text += f"Table: `{settings.get('airtable_table_name', 'Tasks')}`"
+    if storage_type == "airtable":
+        text += f"Base: `{settings.get('airtable_base_id', 'N/A')}`"
     elif storage_type == "sheets":
-        sheet_id = settings.get("google_sheet_id", "N/A")
-        text += f"Sheet: `{sheet_id[:20]}...`"
+        text += f"Sheet: `{settings.get('google_sheet_id', 'N/A')[:20]}...`"
     
     text += "\n\n💡 Use /settings to change"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set preferred language"""
+    keyboard = []
+    row = []
+    for i, (code, name) in enumerate(list(LANGUAGES.items())[:12]):
+        row.append(InlineKeyboardButton(f"{name}", callback_data=f"lang:{code}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    await update.message.reply_text(
+        "🌐 **Select Your Language:**",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle language selection"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    lang_code = query.data.split(":")[1]
+    
+    StorageSettings.set_language(user_id, lang_code)
+    
+    await query.edit_message_text(
+        f"✅ Language set to **{LANGUAGES.get(lang_code, lang_code)}**",
+        parse_mode="Markdown"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# NATURAL LANGUAGE HANDLER
+# MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle natural language messages"""
+    """Handle text messages"""
     user_id = update.effective_user.id
     text = update.message.text
     
     # Check if in setup mode
     if user_id in user_setup_state:
-        await handle_setup_input(update, context)
-        return
+        state = user_setup_state[user_id]
+        
+        if text.lower() == "/cancel":
+            user_setup_state.pop(user_id, None)
+            await update.message.reply_text("Setup cancelled ❌")
+            return
+        
+        # Airtable setup
+        if state["type"] == "airtable":
+            if state["step"] == 1:
+                state["api_key"] = text
+                state["step"] = 2
+                await update.message.reply_text(
+                    "✅ API Key received!\n\n**Step 2/3:** Send your **Base ID** (starts with `app`)",
+                    parse_mode="Markdown"
+                )
+            elif state["step"] == 2:
+                state["base_id"] = text
+                state["step"] = 3
+                await update.message.reply_text(
+                    "✅ Base ID received!\n\n**Step 3/3:** Send your **Table Name** (default: Tasks)",
+                    parse_mode="Markdown"
+                )
+            elif state["step"] == 3:
+                table_name = text or "Tasks"
+                await update.message.reply_text("🔄 Testing connection...")
+                
+                client_at = AirtableClient(state["api_key"], state["base_id"], table_name)
+                result = await client_at.test_connection()
+                
+                if result["success"]:
+                    StorageSettings.set_airtable(user_id, state["api_key"], state["base_id"], table_name)
+                    await update.message.reply_text(f"✅ **Airtable Connected!**\n\n{result['message']}", parse_mode="Markdown")
+                else:
+                    await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+                
+                user_setup_state.pop(user_id, None)
+            return
+        
+        # Sheets setup
+        if state["type"] == "sheets":
+            import re
+            if "docs.google.com/spreadsheets" in text:
+                match = re.search(r'/d/([a-zA-Z0-9-_]+)', text)
+                if match:
+                    text = match.group(1)
+            
+            await update.message.reply_text("🔄 Testing connection...")
+            
+            sheets_client = GoogleSheetsClient(text)
+            result = await sheets_client.test_connection()
+            
+            if result["success"]:
+                StorageSettings.set_google_sheets(user_id, text)
+                await update.message.reply_text(f"✅ **Google Sheets Connected!**", parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+            
+            user_setup_state.pop(user_id, None)
+            return
     
-    # Simple intent detection
-    text_lower = text.lower()
-    
-    # Reminder patterns
-    if any(word in text_lower for word in ["remind", "เตือน", "reminder"]):
-        # Try to parse with AI or simple patterns
-        await update.message.reply_text(
-            "⏰ To set a reminder, use:\n"
-            "`/remind 30m <your reminder>`\n\n"
-            "Examples:\n"
-            "• `/remind 1h Call client`\n"
-            "• `/remind 2d Birthday party`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Task patterns
-    if any(word in text_lower for word in ["task", "todo", "add", "งาน", "เพิ่ม"]):
-        # Extract task from message
-        context.args = text.split()[1:] if len(text.split()) > 1 else []
-        if context.args:
-            await task_command(update, context)
-        else:
-            await update.message.reply_text(
-                "📝 To add a task, use:\n"
-                "`/task <task description>`",
-                parse_mode="Markdown"
-            )
-        return
-    
-    # Default response
+    # Default: just acknowledge
     await update.message.reply_text(
-        "🤖 I'm not sure what you need.\n\n"
-        "Try these commands:\n"
+        "💡 Try:\n"
         "• `/task <title>` - Add task\n"
-        "• `/remind 30m <text>` - Set reminder\n"
-        "• `/note <content>` - Save note\n"
-        "• `/help` - Full guide",
+        "• `/tr th Hello` - Translate\n"
+        "• Send voice → Transcription",
         parse_mode="Markdown"
     )
 
@@ -1155,43 +1083,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    # Initialize database
     init_db()
     
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    
-    # Task commands
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
-    
-    # Reminder commands
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("reminders", reminders_command))
-    
-    # Note commands
     app.add_handler(CommandHandler("note", note_command))
     app.add_handler(CommandHandler("notes", notes_command))
-    
-    # Settings commands
+    app.add_handler(CommandHandler("tr", translate_command))
+    app.add_handler(CommandHandler("translate", translate_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
-    app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))
+    app.add_handler(CommandHandler("language", language_command))
     
-    # Natural language handler (must be last)
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))
+    app.add_handler(CallbackQueryHandler(language_callback, pattern="^lang:"))
+    
+    # Voice handler
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    
+    # Text handler (last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start scheduler for reminders
-    scheduler = AsyncIOScheduler()
-    # Add reminder check job here if needed
-    scheduler.start()
-    
-    # Start polling
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
