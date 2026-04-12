@@ -50,8 +50,8 @@ LANGUAGES = {
     "en": "English", "th": "ไทย", "zh": "中文", "ja": "日本語", "ko": "한국어",
     "vi": "Tiếng Việt", "id": "Bahasa Indonesia", "ms": "Bahasa Melayu",
     "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
-    "pt": "Português", "ru": "Русский", "ar": "العربية", "hi": "हिंदी",
-    "tl": "Tagalog", "my": "မြန်မာ", "km": "ខ្មែរ", "lo": "ລາວ"
+    "pt": "Português", "ru": "Русский", "uk": "Українська", "ar": "العربية", 
+    "hi": "हिंदी", "tl": "Tagalog", "my": "မြန်မာ", "km": "ខ្មែរ", "lo": "ລາວ"
 }
 
 
@@ -430,21 +430,26 @@ async def translate_text(text: str, target_lang: str, source_lang: str = "auto")
     if not client:
         return "❌ OpenAI API not configured"
     
+    import asyncio
+    
     try:
         lang_name = LANGUAGES.get(target_lang, target_lang)
         
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are a translator. Translate the following text to {lang_name}. Only output the translation, nothing else."
-                },
-                {"role": "user", "content": text}
-            ],
-            max_tokens=1000
-        )
+        # Run synchronous OpenAI call in thread pool
+        def do_translate():
+            return client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"You are a translator. Translate the following text to {lang_name}. Only output the translation, nothing else."
+                    },
+                    {"role": "user", "content": text}
+                ],
+                max_tokens=1000
+            )
         
+        response = await asyncio.to_thread(do_translate)
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Translation error: {e}")
@@ -456,14 +461,19 @@ async def transcribe_voice(file_path: str) -> str:
     if not client:
         return "❌ OpenAI API not configured"
     
+    import asyncio
+    
     try:
-        with open(file_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text"
-            )
+        # Run synchronous OpenAI call in thread pool
+        def do_transcribe():
+            with open(file_path, "rb") as audio_file:
+                return client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
         
+        response = await asyncio.to_thread(do_transcribe)
         return response.strip()
     except Exception as e:
         logger.error(f"Transcription error: {e}")
