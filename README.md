@@ -1,5 +1,7 @@
 # Assistant EveryTask Bot 🤖
 
+[![Tests](https://github.com/jajahhhhhhh/Assistant_everyTask_Bot/actions/workflows/tests.yml/badge.svg)](https://github.com/jajahhhhhhh/Assistant_everyTask_Bot/actions/workflows/tests.yml)
+
 AI-powered Telegram bot for productivity!
 
 ## Features
@@ -68,7 +70,8 @@ pytest
 ```
 
 Tests run against a temporary SQLite database and never touch the real one or
-the network.
+the network. They also run in CI on every push to `main` and every pull
+request (`.github/workflows/tests.yml`).
 
 ## Deploy to Railway
 
