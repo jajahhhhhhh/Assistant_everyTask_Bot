@@ -577,8 +577,35 @@ async def transcribe_voice(file_path: str) -> str:
 # REMINDER DELIVERY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _poll_seconds(default: int = 30) -> int:
+    """Read REMINDER_POLL_SECONDS, falling back to the default on a bad value.
+
+    This is evaluated at import, so a typo in the environment must not take
+    the whole bot down before it can say why.
+    """
+    raw = os.getenv("REMINDER_POLL_SECONDS")
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            f"REMINDER_POLL_SECONDS={raw!r} is not an integer; using {default}s"
+        )
+        return default
+
+    if value <= 0:
+        logger.warning(
+            f"REMINDER_POLL_SECONDS={value} must be positive; using {default}s"
+        )
+        return default
+
+    return value
+
+
 # How often the scheduler sweeps the reminders table, in seconds.
-REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30"))
+REMINDER_POLL_SECONDS = _poll_seconds()
 
 
 async def deliver_due_reminders(bot, now: datetime = None) -> int:
@@ -626,7 +653,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
     text = f"""
-👋 **สวัสดี {user.first_name}!** Welcome!
+👋 **สวัสดี {escape_md(user.first_name)}!** Welcome!
 
 🤖 I'm **Assistant EveryTask Bot** - Your personal productivity assistant!
 
@@ -1125,7 +1152,7 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     StorageSettings.set_language(user_id, lang_code)
     
     await query.edit_message_text(
-        f"✅ Language set to **{LANGUAGES.get(lang_code, lang_code)}**",
+        f"✅ Language set to **{escape_md(LANGUAGES.get(lang_code, lang_code))}**",
         parse_mode="Markdown"
     )
 
@@ -1179,9 +1206,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if result["success"]:
                     StorageSettings.set_airtable(user_id, state["api_key"], state["base_id"], table_name)
-                    await update.message.reply_text(f"✅ **Airtable Connected!**\n\n{result['message']}", parse_mode="Markdown")
+                    await update.message.reply_text(f"✅ **Airtable Connected!**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
                 else:
-                    await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+                    await update.message.reply_text(f"❌ **Failed**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
                 
                 user_setup_state.pop(user_id, None)
             return
@@ -1203,7 +1230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 StorageSettings.set_google_sheets(user_id, text)
                 await update.message.reply_text(f"✅ **Google Sheets Connected!**", parse_mode="Markdown")
             else:
-                await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ **Failed**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
             
             user_setup_state.pop(user_id, None)
             return

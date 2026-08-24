@@ -151,3 +151,26 @@ class TestSchedulerWiring:
     async def test_stop_without_start_is_safe(self, bot):
         app = type("App", (), {"bot": None, "bot_data": {}})()
         await bot._stop_scheduler(app)
+
+
+class TestPollSecondsParsing:
+    """A bad REMINDER_POLL_SECONDS used to raise at import, killing the bot
+    before the log could explain why."""
+
+    def test_default_when_unset(self, bot, monkeypatch):
+        monkeypatch.delenv("REMINDER_POLL_SECONDS", raising=False)
+        assert bot._poll_seconds() == 30
+
+    def test_reads_a_valid_value(self, bot, monkeypatch):
+        monkeypatch.setenv("REMINDER_POLL_SECONDS", "5")
+        assert bot._poll_seconds() == 5
+
+    @pytest.mark.parametrize("raw", ["abc", "", "30s", "1.5"])
+    def test_non_integer_falls_back_instead_of_raising(self, bot, monkeypatch, raw):
+        monkeypatch.setenv("REMINDER_POLL_SECONDS", raw)
+        assert bot._poll_seconds() == 30
+
+    @pytest.mark.parametrize("raw", ["0", "-5"])
+    def test_non_positive_falls_back(self, bot, monkeypatch, raw):
+        monkeypatch.setenv("REMINDER_POLL_SECONDS", raw)
+        assert bot._poll_seconds() == 30

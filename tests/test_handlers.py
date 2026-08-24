@@ -243,3 +243,46 @@ class TestHandleMessage:
         await bot.handle_message(update, context)
         assert bot.user_setup_state[USER]["step"] == 3
         assert bot.user_setup_state[USER]["base_id"] == "appYYY"
+
+
+class TestStartCommand:
+    async def test_greets_the_user(self, bot, make):
+        update, context = make()
+        await bot.start_command(update, context)
+        assert "Tester" in update.message.last_reply
+
+    async def test_display_name_is_escaped(self, bot, make):
+        """Regression: /start interpolated user.first_name into a Markdown
+        message unescaped, so a name containing _ or * could make Telegram
+        reject the welcome outright."""
+        update, context = make()
+        update.effective_user.first_name = "Ann_Marie*"
+        await bot.start_command(update, context)
+
+        reply = update.message.last_reply
+        assert "Ann\\_Marie\\*" in reply
+        assert "Ann_Marie*" not in reply
+
+
+class TestLanguageCallbackEscaping:
+    async def test_unknown_language_code_is_escaped(self, bot):
+        """lang_code comes from callback data, so the fallback is
+        externally controlled and must not break the reply."""
+        sent = {}
+
+        class FakeQuery:
+            data = "lang:*_evil"
+
+            async def answer(self):
+                pass
+
+            async def edit_message_text(self, text, **kwargs):
+                sent["text"] = text
+
+        update = type("U", (), {
+            "callback_query": FakeQuery(),
+            "effective_user": type("User", (), {"id": 42})(),
+        })()
+
+        await bot.language_callback(update, None)
+        assert "\\*\\_evil" in sent["text"]
