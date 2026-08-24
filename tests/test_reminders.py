@@ -1,72 +1,153 @@
-"""
-Tests for assistant/reminders.py — reminder parsing and scheduling helpers.
+"""Tests for reminder storage and delivery.
+
+Before the scheduler was wired up, reminders were written to the database and
+listed by /reminders but never actually sent, so these cover both halves.
 """
 
 from datetime import datetime, timedelta
-from unittest.mock import patch
 
 import pytest
 
-from assistant.reminders import parse_reminder_time, schedule_reminder, format_reminder_list
-from assistant.storage import init_db
-
-USER = 77
+USER = 42
+OTHER = 99
 
 
 @pytest.fixture
-def conn():
-    return init_db(":memory:")
+def now():
+    return datetime(2026, 8, 24, 12, 0, 0)
 
 
-class TestParseReminderTime:
-    def test_returns_datetime_for_valid_expression(self):
-        result = parse_reminder_time("in 1 hour")
-        assert result is not None
-        assert isinstance(result, datetime)
-        # Should be approximately 1 hour from now
-        now = datetime.utcnow()
-        assert result > now
-        assert result < now + timedelta(hours=2)
+class TestReminderStorage:
+    async def test_add_and_list(self, bot, now):
+        reminder_id = await bot.Storage.add_reminder(USER, "call mom", now + timedelta(hours=1))
+        assert isinstance(reminder_id, int)
 
-    def test_returns_none_for_garbage(self):
-        result = parse_reminder_time("xyzzy foobar")
-        assert result is None
+        reminders = await bot.Storage.get_reminders(USER)
+        assert [r["text"] for r in reminders] == ["call mom"]
+        assert reminders[0]["status"] == "pending"
 
-    def test_future_preference(self):
-        # "tomorrow" should parse to a future date
-        result = parse_reminder_time("tomorrow at 9am")
-        if result is not None:
-            assert result > datetime.utcnow()
+    async def test_listed_in_chronological_order(self, bot, now):
+        await bot.Storage.add_reminder(USER, "later", now + timedelta(hours=5))
+        await bot.Storage.add_reminder(USER, "sooner", now + timedelta(hours=1))
+        assert [r["text"] for r in await bot.Storage.get_reminders(USER)] == ["sooner", "later"]
 
+    async def test_scoped_per_user(self, bot, now):
+        await bot.Storage.add_reminder(OTHER, "theirs", now + timedelta(hours=1))
+        assert await bot.Storage.get_reminders(USER) == []
 
-class TestScheduleReminder:
-    def test_valid_time_returns_id(self, conn):
-        rid = schedule_reminder(conn, USER, "Test message", "in 30 minutes")
-        assert rid is not None
-        assert isinstance(rid, int)
-
-    def test_invalid_time_returns_none(self, conn):
-        rid = schedule_reminder(conn, USER, "Test message", "blorp blorp")
-        assert rid is None
-
-    def test_reminder_stored_in_db(self, conn):
-        from assistant.storage import get_user_reminders
-        schedule_reminder(conn, USER, "Hello", "in 1 hour")
-        reminders = get_user_reminders(conn, USER)
-        assert len(reminders) == 1
-        assert reminders[0]["message"] == "Hello"
+    async def test_sent_reminders_drop_off_the_list(self, bot, now):
+        reminder_id = await bot.Storage.add_reminder(USER, "done", now - timedelta(minutes=1))
+        await bot.Storage.mark_reminder_sent(reminder_id)
+        assert await bot.Storage.get_reminders(USER) == []
 
 
-class TestFormatReminderList:
-    def test_empty(self):
-        text = format_reminder_list([])
-        assert "No" in text
+class TestDueReminders:
+    async def test_only_returns_reminders_in_the_past(self, bot, now):
+        await bot.Storage.add_reminder(USER, "due", now - timedelta(minutes=1))
+        await bot.Storage.add_reminder(USER, "not yet", now + timedelta(minutes=1))
 
-    def test_non_empty(self):
-        reminders = [
-            {"id": 1, "message": "Call doctor", "remind_at": "2030-01-01T09:00:00"},
-            {"id": 2, "message": "Send report", "remind_at": "2030-01-02T10:00:00"},
-        ]
-        text = format_reminder_list(reminders)
-        assert "Call doctor" in text
-        assert "Send report" in text
+        due = await bot.Storage.get_due_reminders(now)
+        assert [r["text"] for r in due] == ["due"]
+
+    async def test_includes_every_user(self, bot, now):
+        await bot.Storage.add_reminder(USER, "mine", now - timedelta(minutes=1))
+        await bot.Storage.add_reminder(OTHER, "theirs", now - timedelta(minutes=2))
+
+        due = await bot.Storage.get_due_reminders(now)
+        assert {r["user_id"] for r in due} == {USER, OTHER}
+
+    async def test_carries_the_user_id_for_delivery(self, bot, now):
+        await bot.Storage.add_reminder(USER, "ping", now - timedelta(minutes=1))
+        assert (await bot.Storage.get_due_reminders(now))[0]["user_id"] == USER
+
+    async def test_already_sent_are_excluded(self, bot, now):
+        reminder_id = await bot.Storage.add_reminder(USER, "ping", now - timedelta(minutes=1))
+        await bot.Storage.mark_reminder_sent(reminder_id)
+        assert await bot.Storage.get_due_reminders(now) == []
+
+    async def test_mark_sent_is_not_repeatable(self, bot, now):
+        reminder_id = await bot.Storage.add_reminder(USER, "ping", now - timedelta(minutes=1))
+        assert await bot.Storage.mark_reminder_sent(reminder_id) is True
+        assert await bot.Storage.mark_reminder_sent(reminder_id) is False
+
+
+class TestDeliverDueReminders:
+    async def test_sends_due_reminders_to_the_right_chat(self, bot, now, FakeBot):
+        await bot.Storage.add_reminder(USER, "call mom", now - timedelta(minutes=1))
+        fake_bot = FakeBot()
+
+        assert await bot.deliver_due_reminders(fake_bot, now) == 1
+        assert len(fake_bot.sent) == 1
+        assert fake_bot.sent[0]["chat_id"] == USER
+        assert "call mom" in fake_bot.sent[0]["text"]
+
+    async def test_does_not_send_reminders_that_are_not_due(self, bot, now, FakeBot):
+        await bot.Storage.add_reminder(USER, "future", now + timedelta(hours=1))
+        fake_bot = FakeBot()
+
+        assert await bot.deliver_due_reminders(fake_bot, now) == 0
+        assert fake_bot.sent == []
+
+    async def test_a_reminder_is_delivered_exactly_once(self, bot, now, FakeBot):
+        await bot.Storage.add_reminder(USER, "once", now - timedelta(minutes=1))
+        fake_bot = FakeBot()
+
+        assert await bot.deliver_due_reminders(fake_bot, now) == 1
+        assert await bot.deliver_due_reminders(fake_bot, now) == 0
+        assert len(fake_bot.sent) == 1
+
+    async def test_user_text_is_escaped(self, bot, now, FakeBot):
+        await bot.Storage.add_reminder(USER, "ship user_id fix", now - timedelta(minutes=1))
+        fake_bot = FakeBot()
+        await bot.deliver_due_reminders(fake_bot, now)
+
+        assert "user\\_id" in fake_bot.sent[0]["text"]
+
+    async def test_failed_send_stays_pending_for_retry(self, bot, now, FakeBot):
+        """A user who blocked the bot must not silently lose the reminder."""
+        await bot.Storage.add_reminder(USER, "retry me", now - timedelta(minutes=1))
+        blocked = FakeBot(fail_for=[USER])
+
+        assert await bot.deliver_due_reminders(blocked, now) == 0
+        assert [r["text"] for r in await bot.Storage.get_due_reminders(now)] == ["retry me"]
+
+    async def test_one_failure_does_not_block_other_users(self, bot, now, FakeBot):
+        await bot.Storage.add_reminder(USER, "blocked", now - timedelta(minutes=2))
+        await bot.Storage.add_reminder(OTHER, "fine", now - timedelta(minutes=1))
+        partial = FakeBot(fail_for=[USER])
+
+        assert await bot.deliver_due_reminders(partial, now) == 1
+        assert partial.sent[0]["chat_id"] == OTHER
+
+    async def test_no_due_reminders_is_a_noop(self, bot, now, FakeBot):
+        fake_bot = FakeBot()
+        assert await bot.deliver_due_reminders(fake_bot, now) == 0
+
+
+class TestSchedulerWiring:
+    """The scheduler was imported but never started, so nothing ever swept
+    the reminders table. Guard the wiring itself."""
+
+    async def test_start_registers_the_sweep_job(self, bot):
+        app = type("App", (), {"bot": None, "bot_data": {}})()
+        await bot._start_scheduler(app)
+        try:
+            scheduler = app.bot_data["scheduler"]
+            job = scheduler.get_job("deliver_due_reminders")
+            assert job is not None
+            assert job.func is bot.deliver_due_reminders
+        finally:
+            await bot._stop_scheduler(app)
+
+    async def test_stop_releases_the_scheduler(self, bot):
+        app = type("App", (), {"bot": None, "bot_data": {}})()
+        await bot._start_scheduler(app)
+
+        await bot._stop_scheduler(app)
+        assert "scheduler" not in app.bot_data
+        # calling it again must not raise
+        await bot._stop_scheduler(app)
+
+    async def test_stop_without_start_is_safe(self, bot):
+        app = type("App", (), {"bot": None, "bot_data": {}})()
+        await bot._stop_scheduler(app)

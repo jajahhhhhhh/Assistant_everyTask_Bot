@@ -7,6 +7,7 @@ import os
 import sqlite3
 import logging
 import json
+import re
 import tempfile
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -56,6 +57,66 @@ LANGUAGES = {
     "pt": "Português", "ru": "Русский", "uk": "Українська", "ar": "العربية", 
     "hi": "हिंदी", "tl": "Tagalog", "my": "မြန်မာ", "km": "ខ្មែរ", "lo": "ລາວ"
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEXT HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Characters that open a markup entity in Telegram's legacy "Markdown" parse mode.
+_MD_SPECIALS = ("_", "*", "`", "[")
+
+
+def escape_md(text: Any) -> str:
+    """Escape user-supplied text for parse_mode="Markdown".
+
+    Telegram rejects the whole message ("Can't parse entities") when a user's
+    text leaves an unbalanced _, *, ` or [ in the payload, so a task titled
+    "fix user_id" would silently never get a confirmation. Escaping keeps the
+    surrounding template markup working while showing the text verbatim.
+    """
+    if text is None:
+        return ""
+    out = str(text)
+    for ch in _MD_SPECIALS:
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+def escape_code(text: Any) -> str:
+    """Escape user-supplied text used inside a `code span`.
+
+    Only a backtick can terminate a code span early, so that is all we strip.
+    """
+    if text is None:
+        return ""
+    return str(text).replace("`", "'")
+
+
+# Latin keywords are matched on word boundaries so that "flowers" is not "low"
+# and "highlight" is not "high". Thai is written without spaces, so those
+# keywords stay substring matches.
+_PRIORITY_RULES = [
+    ("urgent", [r"\burgent\b", r"\basap\b"], ["ด่วน"]),
+    ("high", [r"\bimportant\b", r"\bhigh\b"], ["สำคัญ"]),
+    ("low", [r"\blow\b", r"\blater\b"], ["ต่ำ"]),
+]
+
+
+def detect_priority(title: str) -> str:
+    """Infer a task priority from its title. Defaults to "medium"."""
+    lowered = (title or "").lower()
+
+    if "!" in lowered:
+        return "urgent"
+
+    for priority, patterns, substrings in _PRIORITY_RULES:
+        if any(re.search(p, lowered) for p in patterns):
+            return priority
+        if any(s in lowered for s in substrings):
+            return priority
+
+    return "medium"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -398,6 +459,35 @@ class Storage:
         return [{"id": r[0], "text": r[1], "remind_at": r[2], "status": r[3]} for r in rows]
     
     @staticmethod
+    async def get_due_reminders(now: datetime = None) -> List[Dict]:
+        """Return every pending reminder that is due, across all users."""
+        now = now or datetime.now()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, text, remind_at
+            FROM reminders
+            WHERE status = 'pending' AND remind_at <= ?
+            ORDER BY remind_at ASC
+        """, (now.isoformat(),))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{"id": r[0], "user_id": r[1], "text": r[2], "remind_at": r[3]} for r in rows]
+
+    @staticmethod
+    async def mark_reminder_sent(reminder_id: int) -> bool:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE reminders SET status = 'sent'
+            WHERE id = ? AND status = 'pending'
+        """, (reminder_id,))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+
+    @staticmethod
     async def add_note(user_id: int, content: str, tags: str = None) -> int:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -481,6 +571,43 @@ async def transcribe_voice(file_path: str) -> str:
     except Exception as e:
         logger.error(f"Transcription error: {e}")
         return f"❌ Transcription error: {str(e)}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REMINDER DELIVERY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# How often the scheduler sweeps the reminders table, in seconds.
+REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30"))
+
+
+async def deliver_due_reminders(bot, now: datetime = None) -> int:
+    """Send every reminder that has come due and mark it delivered.
+
+    Returns the number of reminders actually delivered. A send that fails
+    leaves the reminder pending so the next sweep retries it.
+    """
+    due = await Storage.get_due_reminders(now)
+    delivered = 0
+
+    for reminder in due:
+        try:
+            await bot.send_message(
+                chat_id=reminder["user_id"],
+                text=f"⏰ **Reminder**\n\n📝 {escape_md(reminder['text'])}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send reminder {reminder['id']}: {e}")
+            continue
+
+        await Storage.mark_reminder_sent(reminder["id"])
+        delivered += 1
+
+    if delivered:
+        logger.info(f"Delivered {delivered} reminder(s)")
+
+    return delivered
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -601,16 +728,7 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     title = " ".join(context.args)
-    
-    # Detect priority
-    priority = "medium"
-    title_lower = title.lower()
-    if any(w in title_lower for w in ["urgent", "ด่วน", "asap", "!"]):
-        priority = "urgent"
-    elif any(w in title_lower for w in ["important", "สำคัญ", "high"]):
-        priority = "high"
-    elif any(w in title_lower for w in ["low", "ต่ำ", "later"]):
-        priority = "low"
+    priority = detect_priority(title)
     
     task_id = await Storage.add_task(user_id, title, priority)
     
@@ -618,7 +736,7 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"✅ **Task Added!**\n\n"
-        f"📋 {title}\n"
+        f"📋 {escape_md(title)}\n"
         f"{priority_emoji.get(priority, '⚪')} Priority: {priority}\n\n"
         f"Complete with `/done {task_id}`",
         parse_mode="Markdown"
@@ -649,13 +767,13 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "**📌 To Do:**\n"
         for t in todo[:10]:
             emoji = priority_emoji.get(t["priority"], "⚪")
-            text += f"{emoji} `{t['id']}` {t['title']}\n"
+            text += f"{emoji} `{t['id']}` {escape_md(t['title'])}\n"
         text += "\n"
     
     if doing:
         text += "**⚡ In Progress:**\n"
         for t in doing[:5]:
-            text += f"🔵 `{t['id']}` {t['title']}\n"
+            text += f"🔵 `{t['id']}` {escape_md(t['title'])}\n"
         text += "\n"
     
     if done:
@@ -708,18 +826,15 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args[1:])
     
     now = datetime.now()
-    remind_at = now
     
+    units = {"m": "minutes", "h": "hours", "d": "days"}
     try:
-        if time_str.endswith("m"):
-            remind_at = now + timedelta(minutes=int(time_str[:-1]))
-        elif time_str.endswith("h"):
-            remind_at = now + timedelta(hours=int(time_str[:-1]))
-        elif time_str.endswith("d"):
-            remind_at = now + timedelta(days=int(time_str[:-1]))
-        else:
-            raise ValueError("Invalid format")
-    except:
+        unit = units[time_str[-1]]
+        amount = int(time_str[:-1])
+        if amount <= 0:
+            raise ValueError("duration must be positive")
+        remind_at = now + timedelta(**{unit: amount})
+    except (KeyError, ValueError, IndexError, OverflowError):
         await update.message.reply_text("❌ Use: `30m`, `2h`, `1d`", parse_mode="Markdown")
         return
     
@@ -727,7 +842,7 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"⏰ **Reminder Set!**\n\n"
-        f"📝 {text}\n"
+        f"📝 {escape_md(text)}\n"
         f"🕐 {remind_at.strftime('%Y-%m-%d %H:%M')}",
         parse_mode="Markdown"
     )
@@ -744,7 +859,7 @@ async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "⏰ **Your Reminders**\n\n"
     for r in reminders:
-        text += f"🔔 `{r['id']}` {r['text']}\n   📅 {r['remind_at']}\n\n"
+        text += f"🔔 `{r['id']}` {escape_md(r['text'])}\n   📅 {r['remind_at']}\n\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -782,7 +897,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📝 **Your Notes**\n\n"
     for n in notes[:10]:
         preview = n["content"][:50] + "..." if len(n["content"]) > 50 else n["content"]
-        text += f"`{n['id']}` {preview}\n"
+        text += f"`{n['id']}` {escape_md(preview)}\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -812,7 +927,7 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if target_lang not in LANGUAGES:
         await update.message.reply_text(
-            f"❌ Unknown language: `{target_lang}`\n\n"
+            f"❌ Unknown language: `{escape_code(target_lang)}`\n\n"
             f"Available: en, th, zh, ja, ko, vi, id, es, fr, de...",
             parse_mode="Markdown"
         )
@@ -824,8 +939,8 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"🌐 **Translation**\n\n"
-        f"📝 Original: {text}\n\n"
-        f"🎯 {LANGUAGES[target_lang]}: {translated}",
+        f"📝 Original: {escape_md(text)}\n\n"
+        f"🎯 {LANGUAGES[target_lang]}: {escape_md(translated)}",
         parse_mode="Markdown"
     )
 
@@ -844,6 +959,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🎤 Transcribing your voice message...")
     
+    temp_path = None
     try:
         # Download the voice file
         file: File = await context.bot.get_file(voice.file_id)
@@ -855,9 +971,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Transcribe
         transcription = await transcribe_voice(temp_path)
-        
-        # Clean up
-        os.unlink(temp_path)
         
         # Save to database
         conn = sqlite3.connect(DB_PATH)
@@ -871,7 +984,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"🎤 **Voice Transcription**\n\n"
-            f"📝 {transcription}\n\n"
+            f"📝 {escape_md(transcription)}\n\n"
             f"⏱️ Duration: {voice.duration}s",
             parse_mode="Markdown"
         )
@@ -879,6 +992,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice handling error: {e}")
         await update.message.reply_text(f"❌ Could not transcribe: {str(e)}")
+    finally:
+        # Always remove the download, even if transcription blew up.
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError as e:
+                logger.warning(f"Could not remove temp file {temp_path}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -964,9 +1084,11 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
     if storage_type == "airtable":
-        text += f"Base: `{settings.get('airtable_base_id', 'N/A')}`"
+        base_id = settings.get("airtable_base_id") or "N/A"
+        text += f"Base: `{escape_code(base_id)}`"
     elif storage_type == "sheets":
-        text += f"Sheet: `{settings.get('google_sheet_id', 'N/A')[:20]}...`"
+        sheet_id = settings.get("google_sheet_id") or "N/A"
+        text += f"Sheet: `{escape_code(sheet_id[:20])}...`"
     
     text += "\n\n💡 Use /settings to change"
     
@@ -1012,6 +1134,17 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abort an in-progress storage setup."""
+    user_id = update.effective_user.id
+
+    if user_setup_state.pop(user_id, None) is None:
+        await update.message.reply_text("Nothing to cancel 👍")
+        return
+
+    await update.message.reply_text("Setup cancelled ❌")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
     user_id = update.effective_user.id
@@ -1020,11 +1153,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if in setup mode
     if user_id in user_setup_state:
         state = user_setup_state[user_id]
-        
-        if text.lower() == "/cancel":
-            user_setup_state.pop(user_id, None)
-            await update.message.reply_text("Setup cancelled ❌")
-            return
         
         # Airtable setup
         if state["type"] == "airtable":
@@ -1094,11 +1222,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _start_scheduler(app: Application):
+    """Start the reminder sweep once the bot's event loop is running."""
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        deliver_due_reminders,
+        "interval",
+        seconds=REMINDER_POLL_SECONDS,
+        args=[app.bot],
+        id="deliver_due_reminders",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    app.bot_data["scheduler"] = scheduler
+    logger.info(f"Reminder scheduler started (every {REMINDER_POLL_SECONDS}s)")
+
+
+async def _stop_scheduler(app: Application):
+    scheduler = app.bot_data.pop("scheduler", None)
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
 def main():
     """Start the bot"""
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is not set. Copy .env.example and set it before starting."
+        )
+
     init_db()
     
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_start_scheduler)
+        .post_shutdown(_stop_scheduler)
+        .build()
+    )
     
     # Command handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -1115,6 +1277,7 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
     app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     
     # Callback handlers
     app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))

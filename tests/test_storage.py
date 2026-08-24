@@ -1,186 +1,138 @@
-"""
-Tests for assistant/storage.py — database CRUD operations.
-Uses a temporary in-memory SQLite database so no files are written.
-"""
+"""Tests for the SQLite storage layer in bot.py."""
 
-import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
 
-from assistant.storage import (
-    init_db,
-    save_message,
-    get_recent_messages,
-    create_task,
-    get_tasks,
-    update_task_status,
-    delete_task,
-    create_reminder,
-    get_pending_reminders,
-    get_user_reminders,
-    mark_reminder_sent,
-    create_event,
-    get_events,
-)
+USER = 42
+OTHER = 99
 
-USER_A = 111
-USER_B = 222
-
-
-@pytest.fixture
-def conn():
-    """Return a fresh in-memory DB connection for each test."""
-    return init_db(":memory:")
-
-
-# ── Messages ──────────────────────────────────────────────────────────────────
-
-class TestMessages:
-    def test_save_and_retrieve(self, conn):
-        save_message(conn, USER_A, "Hello")
-        save_message(conn, USER_A, "World", role="assistant")
-        msgs = get_recent_messages(conn, USER_A)
-        assert len(msgs) == 2
-        assert msgs[0]["text"] == "Hello"
-        assert msgs[1]["role"] == "assistant"
-
-    def test_limit(self, conn):
-        for i in range(10):
-            save_message(conn, USER_A, f"msg {i}")
-        msgs = get_recent_messages(conn, USER_A, limit=5)
-        assert len(msgs) == 5
-
-    def test_user_isolation(self, conn):
-        save_message(conn, USER_A, "A's message")
-        save_message(conn, USER_B, "B's message")
-        a_msgs = get_recent_messages(conn, USER_A)
-        b_msgs = get_recent_messages(conn, USER_B)
-        assert len(a_msgs) == 1
-        assert len(b_msgs) == 1
-        assert a_msgs[0]["text"] == "A's message"
-
-
-# ── Tasks ─────────────────────────────────────────────────────────────────────
 
 class TestTasks:
-    def test_create_and_retrieve(self, conn):
-        task_id = create_task(conn, USER_A, "Write report", priority=1, category="business")
-        tasks = get_tasks(conn, USER_A)
-        assert len(tasks) == 1
-        assert tasks[0]["id"] == task_id
-        assert tasks[0]["title"] == "Write report"
-        assert tasks[0]["priority"] == 1
-        assert tasks[0]["category"] == "business"
-        assert tasks[0]["status"] == "pending"
+    async def test_add_returns_id_and_persists(self, bot):
+        task_id = await bot.Storage.add_task(USER, "Write tests")
+        assert isinstance(task_id, int)
 
-    def test_status_filter(self, conn):
-        create_task(conn, USER_A, "Task A")
-        tid2 = create_task(conn, USER_A, "Task B")
-        update_task_status(conn, tid2, "done")
+        tasks = await bot.Storage.get_tasks(USER)
+        assert [t["title"] for t in tasks] == ["Write tests"]
+        assert tasks[0]["status"] == "todo"
+        assert tasks[0]["priority"] == "medium"
 
-        pending = get_tasks(conn, USER_A, status="pending")
-        done = get_tasks(conn, USER_A, status="done")
-        assert len(pending) == 1
-        assert len(done) == 1
+    async def test_priority_and_metadata_round_trip(self, bot):
+        await bot.Storage.add_task(USER, "Ship it", priority="urgent",
+                                   due_date="2026-01-01", project="apollo")
+        task = (await bot.Storage.get_tasks(USER))[0]
+        assert task["priority"] == "urgent"
+        assert task["due_date"] == "2026-01-01"
+        assert task["project"] == "apollo"
 
-    def test_update_status(self, conn):
-        tid = create_task(conn, USER_A, "My task")
-        assert update_task_status(conn, tid, "in_progress") is True
-        tasks = get_tasks(conn, USER_A)
-        assert tasks[0]["status"] == "in_progress"
+    async def test_tasks_are_scoped_per_user(self, bot):
+        await bot.Storage.add_task(USER, "mine")
+        await bot.Storage.add_task(OTHER, "theirs")
+        assert [t["title"] for t in await bot.Storage.get_tasks(USER)] == ["mine"]
+        assert [t["title"] for t in await bot.Storage.get_tasks(OTHER)] == ["theirs"]
 
-    def test_update_nonexistent_returns_false(self, conn):
-        assert update_task_status(conn, 9999, "done") is False
+    async def test_status_filter(self, bot):
+        first = await bot.Storage.add_task(USER, "one")
+        await bot.Storage.add_task(USER, "two")
+        await bot.Storage.complete_task(USER, first)
 
-    def test_delete_task(self, conn):
-        tid = create_task(conn, USER_A, "To delete")
-        assert delete_task(conn, tid) is True
-        assert get_tasks(conn, USER_A) == []
+        assert len(await bot.Storage.get_tasks(USER, status="todo")) == 1
+        assert len(await bot.Storage.get_tasks(USER, status="done")) == 1
 
-    def test_delete_nonexistent_returns_false(self, conn):
-        assert delete_task(conn, 9999) is False
+    async def test_complete_marks_done(self, bot):
+        task_id = await bot.Storage.add_task(USER, "finish me")
+        assert await bot.Storage.complete_task(USER, task_id) is True
+        assert (await bot.Storage.get_tasks(USER))[0]["status"] == "done"
 
-    def test_user_isolation(self, conn):
-        create_task(conn, USER_A, "A's task")
-        create_task(conn, USER_B, "B's task")
-        assert len(get_tasks(conn, USER_A)) == 1
-        assert len(get_tasks(conn, USER_B)) == 1
+    async def test_complete_unknown_task_returns_false(self, bot):
+        assert await bot.Storage.complete_task(USER, 12345) is False
 
-    def test_deadline_stored(self, conn):
-        deadline = "2030-12-31T23:59:59"
-        tid = create_task(conn, USER_A, "Future task", deadline=deadline)
-        tasks = get_tasks(conn, USER_A)
-        assert tasks[0]["deadline"] == deadline
+    async def test_cannot_complete_another_users_task(self, bot):
+        task_id = await bot.Storage.add_task(OTHER, "not yours")
+        assert await bot.Storage.complete_task(USER, task_id) is False
+        assert (await bot.Storage.get_tasks(OTHER))[0]["status"] == "todo"
 
 
-# ── Reminders ─────────────────────────────────────────────────────────────────
+class TestNotes:
+    async def test_add_and_list(self, bot):
+        note_id = await bot.Storage.add_note(USER, "remember the milk")
+        assert isinstance(note_id, int)
 
-class TestReminders:
-    def test_create_and_retrieve(self, conn):
-        future = datetime.utcnow() + timedelta(hours=1)
-        rid = create_reminder(conn, USER_A, "Call Bob", future)
-        reminders = get_user_reminders(conn, USER_A)
-        assert len(reminders) == 1
-        assert reminders[0]["id"] == rid
-        assert reminders[0]["message"] == "Call Bob"
-        assert reminders[0]["sent"] == 0
+        notes = await bot.Storage.get_notes(USER)
+        assert notes[0]["content"] == "remember the milk"
 
-    def test_pending_reminders_only_past_due(self, conn):
-        past = datetime.utcnow() - timedelta(minutes=1)
-        future = datetime.utcnow() + timedelta(hours=2)
-        create_reminder(conn, USER_A, "Past reminder", past)
-        create_reminder(conn, USER_A, "Future reminder", future)
-        pending = get_pending_reminders(conn)
-        assert len(pending) == 1
-        assert pending[0]["message"] == "Past reminder"
+    async def test_notes_are_scoped_per_user(self, bot):
+        await bot.Storage.add_note(USER, "mine")
+        assert await bot.Storage.get_notes(OTHER) == []
 
-    def test_mark_sent(self, conn):
-        past = datetime.utcnow() - timedelta(minutes=5)
-        rid = create_reminder(conn, USER_A, "Hello", past)
-        mark_reminder_sent(conn, rid)
-        pending = get_pending_reminders(conn)
-        assert pending == []
-
-    def test_include_sent(self, conn):
-        past = datetime.utcnow() - timedelta(minutes=5)
-        rid = create_reminder(conn, USER_A, "Hello", past)
-        mark_reminder_sent(conn, rid)
-        all_reminders = get_user_reminders(conn, USER_A, include_sent=True)
-        assert len(all_reminders) == 1
-
-    def test_task_link(self, conn):
-        tid = create_task(conn, USER_A, "Linked task")
-        future = datetime.utcnow() + timedelta(hours=1)
-        rid = create_reminder(conn, USER_A, "Don't forget", future, task_id=tid)
-        reminders = get_user_reminders(conn, USER_A)
-        assert reminders[0]["task_id"] == tid
+    async def test_empty_by_default(self, bot):
+        assert await bot.Storage.get_notes(USER) == []
 
 
-# ── Calendar events ───────────────────────────────────────────────────────────
+class TestStorageSettings:
+    def test_defaults_for_unknown_user(self, bot):
+        settings = bot.StorageSettings.get_settings(USER)
+        assert settings["storage_type"] == "local"
+        assert settings["preferred_language"] == "en"
 
-class TestCalendarEvents:
-    def test_create_and_retrieve(self, conn):
-        start = datetime(2030, 6, 15, 10, 0)
-        end = datetime(2030, 6, 15, 11, 0)
-        eid = create_event(conn, USER_A, "Team meeting", start, end, "Weekly sync")
-        events = get_events(conn, USER_A)
-        assert len(events) == 1
-        assert events[0]["id"] == eid
-        assert events[0]["title"] == "Team meeting"
+    def test_set_storage_type_upserts(self, bot):
+        bot.StorageSettings.set_storage_type(USER, "airtable")
+        assert bot.StorageSettings.get_settings(USER)["storage_type"] == "airtable"
 
-    def test_from_dt_filter(self, conn):
-        past = datetime(2020, 1, 1, 9, 0)
-        future = datetime(2030, 1, 1, 9, 0)
-        create_event(conn, USER_A, "Old event", past)
-        create_event(conn, USER_A, "New event", future)
-        events = get_events(conn, USER_A, from_dt=datetime(2025, 1, 1))
-        assert len(events) == 1
-        assert events[0]["title"] == "New event"
+        bot.StorageSettings.set_storage_type(USER, "local")
+        assert bot.StorageSettings.get_settings(USER)["storage_type"] == "local"
 
-    def test_user_isolation(self, conn):
-        start = datetime(2030, 1, 1, 9, 0)
-        create_event(conn, USER_A, "A's event", start)
-        create_event(conn, USER_B, "B's event", start)
-        assert len(get_events(conn, USER_A)) == 1
-        assert len(get_events(conn, USER_B)) == 1
+    def test_set_airtable(self, bot):
+        bot.StorageSettings.set_airtable(USER, "patXXX", "appYYY", "Todos")
+        settings = bot.StorageSettings.get_settings(USER)
+        assert settings["storage_type"] == "airtable"
+        assert settings["airtable_api_key"] == "patXXX"
+        assert settings["airtable_base_id"] == "appYYY"
+        assert settings["airtable_table_name"] == "Todos"
+
+    def test_set_google_sheets(self, bot):
+        bot.StorageSettings.set_google_sheets(USER, "sheet-123")
+        settings = bot.StorageSettings.get_settings(USER)
+        assert settings["storage_type"] == "sheets"
+        assert settings["google_sheet_id"] == "sheet-123"
+
+    def test_reset_to_local_clears_credentials(self, bot):
+        bot.StorageSettings.set_airtable(USER, "patXXX", "appYYY")
+        bot.StorageSettings.reset_to_local(USER)
+
+        settings = bot.StorageSettings.get_settings(USER)
+        assert settings["storage_type"] == "local"
+        assert settings["airtable_api_key"] is None
+        assert settings["airtable_base_id"] is None
+
+    def test_set_language_preserves_storage_type(self, bot):
+        bot.StorageSettings.set_airtable(USER, "patXXX", "appYYY")
+        bot.StorageSettings.set_language(USER, "th")
+
+        settings = bot.StorageSettings.get_settings(USER)
+        assert settings["preferred_language"] == "th"
+        assert settings["storage_type"] == "airtable"
+
+    def test_settings_are_scoped_per_user(self, bot):
+        bot.StorageSettings.set_language(USER, "ja")
+        assert bot.StorageSettings.get_settings(OTHER)["preferred_language"] == "en"
+
+
+class TestInitDb:
+    async def test_is_idempotent_and_preserves_data(self, bot):
+        await bot.Storage.add_task(USER, "survivor")
+        bot.init_db()
+        bot.init_db()
+        assert [t["title"] for t in await bot.Storage.get_tasks(USER)] == ["survivor"]
+
+    def test_creates_every_table(self, bot):
+        import sqlite3
+
+        conn = sqlite3.connect(bot.DB_PATH)
+        names = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        conn.close()
+        assert {"tasks", "reminders", "notes",
+                "user_storage_settings", "transcriptions"} <= names

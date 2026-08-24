@@ -28,6 +28,7 @@ AI-powered Telegram bot for productivity!
 | `/settings` | Storage settings |
 | `/mystorage` | View settings |
 | `/language` | Set language |
+| `/cancel` | Abort an in-progress storage setup |
 
 ## Translation Examples
 
@@ -48,6 +49,26 @@ Just send any voice message → Auto-transcribed by AI!
 | `TELEGRAM_BOT_TOKEN` | ✅ | From @BotFather |
 | `OPENAI_API_KEY` | ✅ | For translation & transcription |
 | `DATA_DIR` | ❌ | Default: `data` |
+| `OPENAI_MODEL` | ❌ | Default: `gpt-4o-mini` |
+| `REMINDER_POLL_SECONDS` | ❌ | How often due reminders are swept. Default: `30` |
+
+## Reminders
+
+`/remind 30m Call mom` stores a reminder; a background scheduler sweeps the
+table every `REMINDER_POLL_SECONDS` and delivers the ones that have come due.
+A reminder whose send fails (for example the user blocked the bot) stays
+pending and is retried on the next sweep.
+
+## Development
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests run against a temporary SQLite database and never touch the real one or
+the network.
 
 ## Deploy to Railway
 
