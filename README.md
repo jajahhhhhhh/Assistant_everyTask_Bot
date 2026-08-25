@@ -146,8 +146,12 @@ python reno_bridge.py apply --dashboard-dir ~/reno-dashboard
 ### เทสต์
 
 ```bash
-python -m pytest tests/test_line_webhook.py tests/test_reno_bridge.py
+python -m pytest tests/          # 130 เทสต์
+python -m unittest discover -s tests -t .   # ไม่มี pytest ก็รันได้
 ```
+
+เทสต์ทั้งหมดเขียนด้วย `unittest` ล้วน ไม่ต้องมี plugin เพิ่ม และไม่มีตัวไหนต่อเน็ตจริง
+— OpenAI กับ LINE ถูกสลับเป็นตัวปลอมในเทสต์
 
 เทสต์รัน `sql/01_schema.sql` และ `sql/02_views.sql` จริงบนไฟล์ชั่วคราว แล้วอ่านผล
 ผ่าน `v_wait_spans` / `v_unanswered_now` เพื่อยืนยันว่าสิ่งที่ webhook เขียน
