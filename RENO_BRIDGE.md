@@ -33,6 +33,24 @@ LINE ─► line_webhook ─► chat_messages ─► reno_inbox ─► ยืน
 | `reno-stock-move` | เหมือนกัน กรองเฉพาะ `kind=stock` | แถวใหม่เข้า `SAMPLE_ITEMS` |
 | `reno-weekly-brief` | `python reno_bridge.py status --json` | เวลารอสะสมต่อคน มาจาก `task_blocks` ที่ webhook ปิดให้อัตโนมัติ |
 
+สกิลทั้งเจ็ดตัวที่แก้แล้วอยู่ใน [`skills/`](skills/) — คัดลอกกลับเข้าปลั๊กอินได้เลย
+
+### สองรูปแบบ JSON
+
+`--schema dashboard` (ค่าเริ่มต้น) ตรงกับสิ่งที่ `showPreview()` ใน dashboard อ่าน
+ส่วน `--schema skills` ตรงกับ `skills/reno-ingest-chat/references/schemas.md`
+
+| | dashboard | skills |
+|---|---|---|
+| payment | `desc`, `who`, `date: 10/06/69` | `note`, `vendor`, `date: 2026-06-10` |
+| stock | ฟิลด์ของ `SAMPLE_ITEMS` | มี `operation: in\|out`, `category`, `location` |
+| งานที่ยังไม่รู้ไซต์ | `project: ""` | `project: null` + `needs_site: [ids]` |
+
+```bash
+python reno_bridge.py pending --json --schema skills
+python reno_bridge.py export --out reno-import.json          # ไว้วางใน dashboard
+```
+
 สกิลที่อ่าน Kanban/การเงินจากไฟล์ HTML อยู่แล้วไม่ต้องเปลี่ยนวิธีอ่าน — `status --json`
 ตั้งใจไม่นับตัวเลขซ้ำกับไฟล์ HTML ให้เฉพาะส่วนที่ไฟล์ HTML ไม่มี
 
@@ -104,6 +122,9 @@ python line_webhook.py
   `source_ref` และ `linked_task_id`
 - **สะพานพังไม่ทำให้ webhook พัง** — ถ้า `reno_bridge` โยน exception ข้อความยัง
   ถูกบันทึกครบและ event ยังนับว่าประมวลผลสำเร็จ
+- **สกิลเดิมชี้ array ผิดชื่อ** — เอกสารของปลั๊กอินอ้าง `SAMPLE_TASKS`/`SAMPLE_PAYMENTS`
+  แต่ `dashboard-final.html` จริงใช้ `T0`/`P0` และฟิลด์การเงินคือ `who`/`desc`
+  ไม่ใช่ `vendor`/`note` — แก้ให้แล้วใน `skills/` (ดู `skills/README.md`)
 
 ## เทสต์
 

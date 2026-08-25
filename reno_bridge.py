@@ -191,12 +191,19 @@ def _thai_date(iso_or_text: Optional[str]) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 AMOUNT_RE = re.compile(r"(?:฿|บาท\s*)?([0-9][0-9,]{2,})(?:\.\-|\s*บาท|\s*฿)?")
-QTY_RE = re.compile(r"(\d+)\s*(ชิ้น|ดวง|ม้วน|ชุด|กล่อง|ตัว|แผ่น|ถุง|อัน|ชั้น)")
+# ไม่รวม "ชั้น" — "ตึก 3 ชั้น" คือจำนวนชั้นของอาคาร ไม่ใช่จำนวนของในคลัง
+QTY_RE = re.compile(r"(\d+)\s*(ชิ้น|ดวง|ม้วน|ชุด|กล่อง|ตัว|แผ่น|ถุง|อัน|หลอด|เมตร|ท่อน)")
 ORDER_RE = re.compile(r"(?:HomePro|Global House|โฮมโปร|โกลบอล)[^\n]{0,40}?#?\s*([A-Z0-9-]{6,})", re.IGNORECASE)
 
 PAY_RE = re.compile(r"(เบิก|โอน|จ่าย|ค่าแรง|ค่าวัสดุ|บิล|ใบกำกับ|invoice|มัดจำ|ยอด)", re.IGNORECASE)
 PAID_RE = re.compile(r"(โอนแล้ว|จ่ายแล้ว|โอนให้แล้ว|ชำระแล้ว|ได้รับเงินแล้ว|transferred|paid)", re.IGNORECASE)
-STOCK_RE = re.compile(r"(ซื้อ|รับของ|ของเข้า|เบิกของ|สต็อก|สต๊อก|สั่งของ|ของถึง|จัดส่ง|HomePro|Global House)", re.IGNORECASE)
+# คู่กับ QTY_RE เสมอ — ลำพังคำว่า "เบิก" ยังไม่พอ ต้องมีจำนวน+หน่วยของจริงด้วย
+STOCK_RE = re.compile(
+    r"(ซื้อ|รับของ|ของเข้า|เบิก|ใช้|สต็อก|สต๊อก|สั่งของ|ของถึง|จัดส่ง|HomePro|Global House)",
+    re.IGNORECASE,
+)
+# ของออกจากคลัง ต่างจากของเข้า — สกิล reno-stock-move ใช้ค่านี้เลือก in/out
+STOCK_OUT_RE = re.compile(r"(เบิกของ|เบิกออก|ตัดสต็อก|ใช้ไป|เอาไปใช้|เบิก[^\n]{0,30}?ไป)", re.IGNORECASE)
 # เฉพาะคำที่เป็น "การลงมือทำ" จริง ๆ — คำกว้างอย่าง งาน/ทำ ใช้ไม่ได้
 # เพราะ "ค่าแรงงาน" ในข้อความเบิกเงินจะกลายเป็นการ์ดงานผีทุกครั้ง
 TASK_RE = re.compile(
@@ -357,6 +364,8 @@ def extract_items(
                     "price": amount // quantity if amount and quantity else 0,
                     "loc": "",
                     "note": f"จาก LINE {date_iso}",
+                    # ของเข้าคลังเป็นค่าเริ่มต้น เว้นแต่ข้อความบอกว่าเบิกออกไปใช้
+                    "operation": "out" if STOCK_OUT_RE.search(body) else "in",
                 },
             }
         )
@@ -371,7 +380,7 @@ def extract_items(
                 "site": site,
                 "confidence": 0.7 if site else 0.45,
                 "payload": {
-                    "title": body.split("\n", 1)[0][:120],
+                    "title": _task_title(body),
                     "note": body[:300],
                     "status": status,
                     "project": site or "",
@@ -384,6 +393,19 @@ def extract_items(
         )
 
     return items
+
+
+def _task_title(body: str) -> str:
+    """ตัดท่อนเรื่องเงินออกจากชื่องาน
+
+    "เดินสายไฟชั้น 3 เสร็จแล้ว ขอเบิกค่าแรง 15,000" → ชื่องานคือท่อนแรก
+    ส่วนยอดเงินไปอยู่ในรายการ payment ของตัวเองแล้ว ไม่ต้องแปะไว้บนหัวการ์ด
+    """
+    first_line = body.split("\n", 1)[0].strip()
+    cut = re.search(r"\s*(ขอเบิก|เบิกค่า|เบิกเงิน|ค่าแรง|ยอด|บิล)", first_line)
+    if cut and len(first_line[: cut.start()].strip()) >= 8:
+        first_line = first_line[: cut.start()].strip()
+    return first_line[:120]
 
 
 def fingerprint(kind: str, payload: Dict[str, Any]) -> str:
@@ -487,15 +509,20 @@ def scan_backlog(conn: sqlite3.Connection, config: Dict[str, Any]) -> int:
 def get_inbox(
     conn: sqlite3.Connection, status: str = "pending", ids: Optional[Sequence[int]] = None
 ) -> List[Dict[str, Any]]:
-    sql = "SELECT * FROM reno_inbox WHERE 1=1"
+    # ดึง sent_at ของข้อความต้นทางมาด้วย — สกิลต้องการวันที่แบบ ISO ส่วน dashboard
+    # ต้องการ DD/MM/YY เก็บอันเดียวแล้วแปลงตอนใช้ ดีกว่าเก็บวันที่ซ้ำสองรูปแบบ
+    sql = (
+        "SELECT r.*, m.sent_at AS message_sent_at "
+        "FROM reno_inbox r LEFT JOIN chat_messages m ON m.id = r.chat_message_id WHERE 1=1"
+    )
     params: List[Any] = []
     if status != "all":
-        sql += " AND status = ?"
+        sql += " AND r.status = ?"
         params.append(status)
     if ids:
-        sql += f" AND id IN ({','.join('?' for _ in ids)})"
+        sql += f" AND r.id IN ({','.join('?' for _ in ids)})"
         params.extend(ids)
-    sql += " ORDER BY id"
+    sql += " ORDER BY r.id"
 
     rows = []
     for row in conn.execute(sql, params):
@@ -544,6 +571,66 @@ def as_import_payload(items: Sequence[Dict[str, Any]], config: Dict[str, Any]) -
         "stock": stock,
         "summary": summary,
         "ids": [i["id"] for i in items],
+    }
+
+
+def as_skill_payload(items: Sequence[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+    """รูปแบบตาม skills/reno-ingest-chat/references/schemas.md
+
+    ต่างจากรูปแบบของ dashboard สองจุด: payment ใช้ vendor/note และวันที่เป็น ISO
+    ส่วน stock มี operation/category/location สกิลปลายทางจึงรับไปใช้ต่อได้ทันที
+    """
+    tasks, payments, stock = [], [], []
+    for item in items:
+        payload = item["payload"]
+        iso = (item.get("message_sent_at") or item["created_at"])[:10]
+        if item["kind"] == "task":
+            tasks.append(payload)
+        elif item["kind"] == "payment":
+            payments.append(
+                {
+                    "vendor": payload.get("who") or config["contractor"],
+                    "amount": payload.get("amount", 0),
+                    "status": payload.get("status", "pending"),
+                    "project": payload.get("project") or None,
+                    "date": iso,
+                    "note": payload.get("desc", ""),
+                }
+            )
+        else:
+            stock.append(
+                {
+                    "name": payload.get("name", ""),
+                    "sku": payload.get("sku", ""),
+                    "operation": payload.get("operation", "in"),
+                    "qty": payload.get("qty", 0),
+                    "unit": payload.get("unit", ""),
+                    "project": payload.get("proj") or None,
+                    "price": payload.get("price", 0),
+                    "category": payload.get("cat", "อื่นๆ"),
+                    "location": payload.get("loc", ""),
+                }
+            )
+
+    unassigned = [
+        i["id"] for i in items if not (i["payload"].get("project") or i["payload"].get("proj"))
+    ]
+    return {
+        "summary": {
+            "tasks": len(tasks),
+            "payments": len(payments),
+            "stock_items": len(stock),
+            "status_updates": 0,
+            "unclassified": len(unassigned),
+        },
+        "tasks": tasks,
+        "payments": payments,
+        "stock": stock,
+        # bridge ไม่เดาว่าข้อความไหนเป็นการอัปเดตงานเดิม — ปล่อยให้สกิลจับคู่เอง
+        "status_updates": [],
+        "unclassified": [],
+        "inbox_ids": [i["id"] for i in items],
+        "needs_site": unassigned,
     }
 
 
@@ -1004,6 +1091,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for name in ("pending", "approved"):
         p = sub.add_parser(name, help=f"รายการสถานะ {name}")
         p.add_argument("--json", action="store_true")
+        p.add_argument("--schema", choices=("dashboard", "skills"), default="dashboard")
 
     for name in ("approve", "skip"):
         p = sub.add_parser(name, help=f"เปลี่ยนสถานะเป็น {name}")
@@ -1017,6 +1105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("export", help="เขียน JSON สำหรับวางในช่อง 'วางข้อความ' ของ dashboard")
     p.add_argument("--out", default="reno-import.json")
     p.add_argument("--status", default="pending")
+    p.add_argument("--schema", choices=("dashboard", "skills"), default="dashboard")
 
     p = sub.add_parser("status", help="ภาพรวม: คิว + งานที่ติด + คำถามค้าง")
     p.add_argument("--json", action="store_true")
@@ -1032,7 +1121,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command in ("pending", "approved"):
             items = get_inbox(conn, args.command)
             if args.json:
-                print(json.dumps(as_import_payload(items, config), ensure_ascii=False, indent=2))
+                shape = as_skill_payload if args.schema == "skills" else as_import_payload
+                print(json.dumps(shape(items, config), ensure_ascii=False, indent=2))
             else:
                 print(RenoBridge(config).summarize(items) if items else "📭 คิวว่าง")
 
@@ -1061,7 +1151,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         elif args.command == "export":
             items = get_inbox(conn, args.status)
-            payload = as_import_payload(items, config)
+            shape = as_skill_payload if args.schema == "skills" else as_import_payload
+            payload = shape(items, config)
             Path(args.out).write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )

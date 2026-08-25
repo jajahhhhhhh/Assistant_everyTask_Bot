@@ -254,6 +254,57 @@ class TestQueue(BridgeCase):
         self.assertIn("฿15,000", payload["summary"])
 
 
+class TestSkillSchema(BridgeCase):
+    """รูปแบบตาม skills/reno-ingest-chat/references/schemas.md"""
+
+    def queue(self, text):
+        message_id = self.add_message(text)
+        rb.scan_message(
+            self.conn, chat_message_id=message_id, text=text,
+            sent_at="2026-08-20T10:00:00Z", config=self.config,
+        )
+
+    def test_payment_uses_vendor_note_and_iso_date(self):
+        self.queue("พี่ปอขอเบิกค่าแรงเฉวง 15,000 บาท")
+        payload = rb.as_skill_payload(rb.get_inbox(self.conn), self.config)
+        payment = payload["payments"][0]
+        self.assertEqual(
+            set(payment), {"vendor", "amount", "status", "project", "date", "note"}
+        )
+        self.assertEqual(payment["date"], "2026-08-20", "schemas.md ห้ามใช้ 20/08/69")
+        self.assertEqual(payment["amount"], 15000)
+        self.assertEqual(payment["project"], "Chaweng")
+
+    def test_stock_carries_operation_and_category(self):
+        self.queue("ซื้อดาวน์ไลท์ HomePro 10 ดวง 1,250 บาท ส่งเฉวง")
+        payload = rb.as_skill_payload(rb.get_inbox(self.conn), self.config)
+        stock = payload["stock"][0]
+        self.assertEqual(stock["operation"], "in")
+        self.assertEqual(stock["category"], "โคมไฟ")
+        self.assertEqual(stock["project"], "Chaweng")
+
+    def test_taking_stock_out_is_an_out_operation(self):
+        self.queue("เบิกสายไฟ 2 ม้วน ไปหน้างานเฉวง")
+        payload = rb.as_skill_payload(rb.get_inbox(self.conn), self.config)
+        self.assertEqual(payload["stock"][0]["operation"], "out")
+
+    def test_unknown_site_is_null_and_listed(self):
+        self.queue("ขอเบิกค่าแรง 8,000 บาท")
+        payload = rb.as_skill_payload(rb.get_inbox(self.conn), self.config)
+        self.assertIsNone(payload["payments"][0]["project"])
+        self.assertEqual(payload["summary"]["unclassified"], 1)
+        self.assertTrue(payload["needs_site"])
+
+    def test_summary_block_shape(self):
+        self.queue("เดินสายไฟชั้น 3 เฉวงเสร็จแล้ว")
+        payload = rb.as_skill_payload(rb.get_inbox(self.conn), self.config)
+        self.assertEqual(
+            set(payload["summary"]),
+            {"tasks", "payments", "stock_items", "status_updates", "unclassified"},
+        )
+        self.assertEqual(payload["status_updates"], [], "bridge ไม่เดาการอัปเดตงานเดิม")
+
+
 class TestArrayWriting(unittest.TestCase):
     def test_appends_before_the_closing_bracket(self):
         source, refs = rb.append_to_array(
@@ -453,6 +504,15 @@ class TestCli(BridgeCase):
         self.assertEqual(self.run_cli("apply", "--dashboard-dir", str(self.dir)), 0)
         html = (self.dir / "dashboard-final.html").read_text(encoding="utf-8")
         self.assertIn("เดินสายไฟชั้น 3", html)
+
+    def test_export_with_skills_schema(self):
+        self.add_message("ขอเบิกค่าแรงเฉวง 15,000 บาท")
+        self.run_cli("scan")
+        out = self.dir / "skills.json"
+        self.run_cli("export", "--out", str(out), "--schema", "skills")
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        self.assertIn("vendor", payload["payments"][0])
+        self.assertEqual(payload["payments"][0]["date"], "2026-08-20")
 
     def test_export_writes_importable_json(self):
         self.add_message("ขอเบิกค่าแรงเฉวง 15,000 บาท")
