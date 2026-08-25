@@ -1180,9 +1180,18 @@ class LineWebhookHandler:
         return task
 
     async def drain(self, timeout: float = 30.0) -> None:
-        """รอให้ event ที่ค้างอยู่ทำงานจบก่อนปิดโปรเซส"""
-        if self._tasks:
-            await asyncio.wait(set(self._tasks), timeout=timeout)
+        """รอให้ event ที่ค้างอยู่ทำงานจบก่อนปิดโปรเซส
+
+        วนจนกว่าคิวจะว่างจริง ไม่ใช่รอแค่รอบเดียว — งานที่ถูกสร้างระหว่างรออยู่
+        จะได้ไม่ถูกทิ้งค้างตอนปิดโปรเซส
+        """
+        deadline = time.monotonic() + timeout
+        while self._tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("ยังมีงานเบื้องหลังค้างอยู่ %d รายการตอนปิด", len(self._tasks))
+                return
+            await asyncio.wait(set(self._tasks), timeout=remaining)
 
     async def close(self) -> None:
         await self.drain()

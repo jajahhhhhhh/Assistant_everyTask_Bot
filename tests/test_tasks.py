@@ -1,97 +1,77 @@
 """
-Tests for assistant/tasks.py — task management helpers.
+เทสต์งานใน bot.py — Storage.add_task / get_tasks / complete_task
+
+(ไฟล์เดิมเทสต์ assistant/tasks.py ซึ่งถูกลบไปแล้ว)
 """
 
-import pytest
-import sqlite3
+import unittest
 
-from assistant.storage import init_db
-from assistant.tasks import (
-    add_task,
-    format_task,
-    format_task_list,
-    task_statistics,
-)
+from tests._bot_case import BotDbCase, bot
 
-USER = 42
+USER_A = 111
+USER_B = 222
 
 
-@pytest.fixture
-def conn():
-    return init_db(":memory:")
+class TestAddTask(BotDbCase):
+    async def test_defaults(self):
+        task_id = await bot.Storage.add_task(USER_A, "เขียนเทสต์")
+        task = (await bot.Storage.get_tasks(USER_A))[0]
+        self.assertEqual(task["id"], task_id)
+        self.assertEqual(task["title"], "เขียนเทสต์")
+        self.assertEqual(task["priority"], "medium")
+        self.assertEqual(task["status"], "todo")
+
+    async def test_optional_fields_are_stored(self):
+        await bot.Storage.add_task(
+            USER_A, "ยื่นเอกสาร", priority="high", due_date="2026-09-01", project="เฉวง"
+        )
+        task = (await bot.Storage.get_tasks(USER_A))[0]
+        self.assertEqual(task["priority"], "high")
+        self.assertEqual(task["due_date"], "2026-09-01")
+        self.assertEqual(task["project"], "เฉวง")
+
+    async def test_ids_are_unique(self):
+        first = await bot.Storage.add_task(USER_A, "งานหนึ่ง")
+        second = await bot.Storage.add_task(USER_A, "งานสอง")
+        self.assertNotEqual(first, second)
 
 
-class TestAddTask:
-    def test_basic(self, conn):
-        task = add_task(conn, USER, "Write tests")
-        assert task["id"] is not None
-        assert task["title"] == "Write tests"
-        assert task["status"] == "pending"
-        assert task["priority"] == 2
-        assert task["category"] == "general"
+class TestListTasks(BotDbCase):
+    async def test_only_your_own_tasks(self):
+        await bot.Storage.add_task(USER_A, "ของ A")
+        await bot.Storage.add_task(USER_B, "ของ B")
+        self.assertEqual([t["title"] for t in await bot.Storage.get_tasks(USER_A)], ["ของ A"])
 
-    def test_custom_category_priority(self, conn):
-        task = add_task(conn, USER, "Urgent report", category="business", priority=1)
-        assert task["category"] == "business"
-        assert task["priority"] == 1
+    async def test_filter_by_status(self):
+        keep = await bot.Storage.add_task(USER_A, "ยังไม่เสร็จ")
+        done = await bot.Storage.add_task(USER_A, "เสร็จแล้ว")
+        await bot.Storage.complete_task(USER_A, done)
 
-    def test_deadline_stored(self, conn):
-        task = add_task(conn, USER, "Deadline task", deadline="2030-01-01")
-        assert task["deadline"] == "2030-01-01"
+        todo = await bot.Storage.get_tasks(USER_A, status="todo")
+        self.assertEqual([t["id"] for t in todo], [keep])
+        self.assertEqual([t["id"] for t in await bot.Storage.get_tasks(USER_A, status="done")], [done])
 
-
-class TestFormatTask:
-    def test_format_includes_title(self, conn):
-        task = add_task(conn, USER, "Review PR")
-        text = format_task(task)
-        assert "Review PR" in text
-
-    def test_format_includes_category(self, conn):
-        task = add_task(conn, USER, "Invoice", category="business")
-        text = format_task(task)
-        assert "Business" in text or "business" in text
-
-    def test_format_includes_priority(self, conn):
-        task = add_task(conn, USER, "Rush job", priority=1)
-        text = format_task(task)
-        assert "High" in text
-
-    def test_format_with_description(self, conn):
-        task = add_task(conn, USER, "Call", description="Call Alice about the project")
-        text = format_task(task)
-        assert "Call Alice" in text
-
-    def test_format_with_deadline(self, conn):
-        task = add_task(conn, USER, "Submit", deadline="2030-12-31")
-        text = format_task(task)
-        assert "2030-12-31" in text
+    async def test_empty_list_for_a_new_user(self):
+        self.assertEqual(await bot.Storage.get_tasks(USER_A), [])
 
 
-class TestFormatTaskList:
-    def test_empty_list(self):
-        text = format_task_list([])
-        assert "No tasks" in text
+class TestCompleteTask(BotDbCase):
+    async def test_marks_done_and_stamps_the_time(self):
+        task_id = await bot.Storage.add_task(USER_A, "งานที่จะปิด")
+        self.assertTrue(await bot.Storage.complete_task(USER_A, task_id))
 
-    def test_non_empty_list(self, conn):
-        t1 = add_task(conn, USER, "Task 1")
-        t2 = add_task(conn, USER, "Task 2")
-        text = format_task_list([t1, t2])
-        assert "Task 1" in text
-        assert "Task 2" in text
+        row = self.rows("SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,))[0]
+        self.assertEqual(row["status"], "done")
+        self.assertIsNotNone(row["completed_at"])
+
+    async def test_cannot_close_someone_elses_task(self):
+        task_id = await bot.Storage.add_task(USER_A, "ของ A")
+        self.assertFalse(await bot.Storage.complete_task(USER_B, task_id))
+        self.assertEqual((await bot.Storage.get_tasks(USER_A))[0]["status"], "todo")
+
+    async def test_unknown_task_id(self):
+        self.assertFalse(await bot.Storage.complete_task(USER_A, 9999))
 
 
-class TestTaskStatistics:
-    def test_counts_by_status(self):
-        tasks = [
-            {"status": "pending"},
-            {"status": "pending"},
-            {"status": "done"},
-            {"status": "cancelled"},
-        ]
-        stats = task_statistics(tasks)
-        assert stats["pending"] == 2
-        assert stats["done"] == 1
-        assert stats["cancelled"] == 1
-
-    def test_empty_returns_empty_dict(self):
-        assert task_statistics([]) == {}
+if __name__ == "__main__":
+    unittest.main()

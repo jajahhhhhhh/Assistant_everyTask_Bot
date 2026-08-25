@@ -4,6 +4,7 @@ Features: Tasks, Reminders, Notes, Storage Settings, Translation, Voice Transcri
 """
 
 import os
+import re
 import sqlite3
 import logging
 import json
@@ -491,6 +492,25 @@ user_setup_state: Dict[int, Dict[str, Any]] = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DURATION_RE = re.compile(r"^(\d+)\s*([mhd])$", re.IGNORECASE)
+DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days"}
+
+
+def parse_duration(text: str) -> Optional[timedelta]:
+    """Turn '30m', '2h', '1d' into a timedelta. None when it isn't one."""
+    match = DURATION_RE.match((text or "").strip())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    if amount <= 0:
+        return None
+    return timedelta(**{DURATION_UNITS[match.group(2).lower()]: amount})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -704,24 +724,14 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    time_str = context.args[0].lower()
     text = " ".join(context.args[1:])
     
-    now = datetime.now()
-    remind_at = now
-    
-    try:
-        if time_str.endswith("m"):
-            remind_at = now + timedelta(minutes=int(time_str[:-1]))
-        elif time_str.endswith("h"):
-            remind_at = now + timedelta(hours=int(time_str[:-1]))
-        elif time_str.endswith("d"):
-            remind_at = now + timedelta(days=int(time_str[:-1]))
-        else:
-            raise ValueError("Invalid format")
-    except:
+    delta = parse_duration(context.args[0])
+    if delta is None:
         await update.message.reply_text("❌ Use: `30m`, `2h`, `1d`", parse_mode="Markdown")
         return
+    
+    remind_at = datetime.now() + delta
     
     await Storage.add_reminder(user_id, text, remind_at)
     

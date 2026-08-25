@@ -1,189 +1,123 @@
 """
-Tests for assistant/translator.py — translation functionality.
-Tests run without OpenAI API key using fallback detection.
+เทสต์บริการ AI ของ bot.py — แปลภาษาและถอดเสียง
+
+(ไฟล์เดิมเทสต์ assistant/translator.py ซึ่งถูกลบไปแล้ว ตอนนี้ทั้งสองอย่างอยู่ใน
+bot.py และเรียก OpenAI ผ่านตัวแปรโมดูล `client` จึงสลับเป็นตัวปลอมได้ในเทสต์
+ไม่มีเทสต์ไหนต่อเน็ตจริง)
 """
 
-import pytest
+import sys
+import tempfile
+import unittest
+from pathlib import Path
 
-from assistant.translator import (
-    detect_language,
-    resolve_language_code,
-    translate,
-    translate_multi,
-    format_translation_result,
-    format_language_list,
-    format_detected_language,
-    SUPPORTED_LANGUAGES,
-    LANGUAGE_ALIASES,
-    LANGUAGE_FLAGS,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import bot
 
 
-class TestResolveLanguageCode:
-    """Test language code resolution."""
+class FakeCompletions:
+    def __init__(self, reply="สวัสดีโลก", error=None):
+        self.reply = reply
+        self.error = error
+        self.calls = []
 
-    def test_direct_code(self):
-        assert resolve_language_code("en") == "en"
-        assert resolve_language_code("th") == "th"
-        assert resolve_language_code("ru") == "ru"
-
-    def test_english_name(self):
-        assert resolve_language_code("English") == "en"
-        assert resolve_language_code("thai") == "th"
-        assert resolve_language_code("Russian") == "ru"
-        assert resolve_language_code("CHINESE") == "zh"
-
-    def test_native_name(self):
-        assert resolve_language_code("ไทย") == "th"
-        assert resolve_language_code("русский") == "ru"
-        assert resolve_language_code("中文") == "zh"
-
-    def test_case_insensitive(self):
-        assert resolve_language_code("ENGLISH") == "en"
-        assert resolve_language_code("Thai") == "th"
-        assert resolve_language_code("RUSSIAN") == "ru"
-
-    def test_unknown_returns_none(self):
-        assert resolve_language_code("klingon") is None
-        assert resolve_language_code("xyz") is None
-        assert resolve_language_code("") is None
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        message = type("Message", (), {"content": self.reply})
+        choice = type("Choice", (), {"message": message})
+        return type("Response", (), {"choices": [choice]})
 
 
-class TestDetectLanguage:
-    """Test language detection (fallback Unicode-based)."""
+class FakeTranscriptions:
+    def __init__(self, text="ทดสอบเสียง", error=None):
+        self.text = text
+        self.error = error
+        self.calls = []
 
-    def test_detect_thai(self):
-        assert detect_language("สวัสดีครับ") == "th"
-        assert detect_language("ภาษาไทย") == "th"
-
-    def test_detect_russian(self):
-        assert detect_language("Привет мир") == "ru"
-        assert detect_language("Доброе утро") == "ru"
-
-    def test_detect_chinese(self):
-        assert detect_language("你好世界") == "zh"
-        assert detect_language("中文测试") == "zh"
-
-    def test_detect_japanese(self):
-        assert detect_language("こんにちは") == "ja"
-        assert detect_language("ありがとう") == "ja"
-
-    def test_detect_korean(self):
-        assert detect_language("안녕하세요") == "ko"
-        assert detect_language("감사합니다") == "ko"
-
-    def test_detect_arabic(self):
-        assert detect_language("مرحبا بالعالم") == "ar"
-
-    def test_english_default(self):
-        # ASCII text defaults to English
-        assert detect_language("Hello world") == "en"
-        assert detect_language("Good morning") == "en"
-
-    def test_empty_returns_english(self):
-        assert detect_language("") == "en"
-        assert detect_language("   ") == "en"
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return self.text
 
 
-class TestTranslate:
-    """Test translation function (without OpenAI, returns error)."""
-
-    def test_invalid_target_language(self):
-        result = translate("Hello", "klingon")
-        assert result["success"] is False
-        assert "Unsupported" in result["error"]
-
-    def test_same_language_skipped(self):
-        # When source and target are same, returns original
-        result = translate("Hello", "en", source_lang="en")
-        assert result["success"] is True
-        assert result["translated_text"] == "Hello"
-        assert "same" in result.get("note", "").lower()
-
-    def test_returns_source_and_target(self):
-        result = translate("สวัสดี", "en")
-        assert result["target_lang"] == "en"
-        # Source should be detected as Thai
-        assert result["source_lang"] == "th"
-
-    def test_no_api_key_error(self):
-        # Without OpenAI key, translation fails gracefully
-        result = translate("Hello", "th")
-        # Either succeeds (if API key) or fails with helpful error
-        if not result["success"]:
-            assert "unavailable" in result["error"].lower() or "OPENAI" in result["error"]
+class FakeClient:
+    def __init__(self, completions=None, transcriptions=None):
+        self.chat = type("Chat", (), {"completions": completions or FakeCompletions()})
+        self.audio = type("Audio", (), {"transcriptions": transcriptions or FakeTranscriptions()})
 
 
-class TestTranslateMulti:
-    """Test multi-language translation."""
+class ClientCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._original_client = bot.client
 
-    def test_returns_dict_of_results(self):
-        results = translate_multi("Hello", ["th", "ru"])
-        assert "th" in results
-        assert "ru" in results
-        assert isinstance(results["th"], dict)
-        assert isinstance(results["ru"], dict)
-
-    def test_each_result_has_required_keys(self):
-        results = translate_multi("Hello", ["th"])
-        result = results["th"]
-        assert "success" in result
-        assert "target_lang" in result
+    async def asyncTearDown(self):
+        bot.client = self._original_client
 
 
-class TestFormatFunctions:
-    """Test formatting helper functions."""
+class TestLanguages(unittest.TestCase):
+    def test_common_codes_are_present(self):
+        for code in ("en", "th", "ja", "zh"):
+            self.assertIn(code, bot.LANGUAGES)
 
-    def test_format_translation_result_success(self):
-        result = {
-            "success": True,
-            "translated_text": "สวัสดี",
-            "source_lang": "en",
-            "target_lang": "th",
-        }
-        formatted = format_translation_result(result)
-        assert "Translation" in formatted
-        assert "สวัสดี" in formatted
-        assert "English" in formatted or "🇬🇧" in formatted
-        assert "Thai" in formatted or "🇹🇭" in formatted
-
-    def test_format_translation_result_failure(self):
-        result = {
-            "success": False,
-            "error": "API unavailable",
-        }
-        formatted = format_translation_result(result)
-        assert "❌" in formatted
-        assert "failed" in formatted.lower()
-
-    def test_format_language_list(self):
-        formatted = format_language_list()
-        assert "Supported Languages" in formatted
-        assert "en" in formatted
-        assert "English" in formatted
-        assert "th" in formatted
-        assert "Thai" in formatted
-
-    def test_format_detected_language(self):
-        formatted = format_detected_language("สวัสดี")
-        assert "Thai" in formatted
-        assert "th" in formatted
-        assert "Detected" in formatted
+    def test_every_entry_has_a_display_name(self):
+        for code, name in bot.LANGUAGES.items():
+            self.assertTrue(name.strip(), code)
+            self.assertRegex(code, r"^[a-z]{2}$")
 
 
-class TestLanguageData:
-    """Test language data consistency."""
+class TestTranslate(ClientCase):
+    async def test_returns_the_model_output_trimmed(self):
+        completions = FakeCompletions(reply="  สวัสดีโลก \n")
+        bot.client = FakeClient(completions=completions)
 
-    def test_all_languages_have_flags(self):
-        for code in SUPPORTED_LANGUAGES:
-            assert code in LANGUAGE_FLAGS, f"Missing flag for {code}"
+        self.assertEqual(await bot.translate_text("Hello world", "th"), "สวัสดีโลก")
 
-    def test_aliases_map_to_valid_codes(self):
-        for alias, code in LANGUAGE_ALIASES.items():
-            assert code in SUPPORTED_LANGUAGES, f"Alias {alias} maps to invalid code {code}"
+    async def test_target_language_name_reaches_the_prompt(self):
+        completions = FakeCompletions()
+        bot.client = FakeClient(completions=completions)
 
-    def test_minimum_languages_supported(self):
-        # Should support at least these common languages
-        required = ["en", "th", "ru", "zh", "ja", "ko", "es", "fr", "de"]
-        for lang in required:
-            assert lang in SUPPORTED_LANGUAGES, f"Missing required language: {lang}"
+        await bot.translate_text("Hello", "ja")
+        system_prompt = completions.calls[0]["messages"][0]["content"]
+        self.assertIn(bot.LANGUAGES["ja"], system_prompt)
+        self.assertEqual(completions.calls[0]["messages"][1]["content"], "Hello")
+
+    async def test_unknown_language_code_is_passed_through(self):
+        completions = FakeCompletions()
+        bot.client = FakeClient(completions=completions)
+
+        await bot.translate_text("Hello", "xx")
+        self.assertIn("xx", completions.calls[0]["messages"][0]["content"])
+
+    async def test_without_a_configured_client(self):
+        bot.client = None
+        self.assertIn("not configured", await bot.translate_text("Hello", "th"))
+
+    async def test_api_errors_are_reported_not_raised(self):
+        bot.client = FakeClient(completions=FakeCompletions(error=RuntimeError("rate limited")))
+        result = await bot.translate_text("Hello", "th")
+        self.assertIn("rate limited", result)
+
+
+class TestTranscribe(ClientCase):
+    async def test_returns_the_transcript(self):
+        bot.client = FakeClient(transcriptions=FakeTranscriptions(text=" ทดสอบเสียง "))
+        with tempfile.NamedTemporaryFile(suffix=".ogg") as audio:
+            audio.write(b"not really audio")
+            audio.flush()
+            self.assertEqual(await bot.transcribe_voice(audio.name), "ทดสอบเสียง")
+
+    async def test_without_a_configured_client(self):
+        bot.client = None
+        self.assertIn("not configured", await bot.transcribe_voice("/tmp/whatever.ogg"))
+
+    async def test_missing_file_is_reported_not_raised(self):
+        bot.client = FakeClient()
+        self.assertIn("error", (await bot.transcribe_voice("/tmp/does-not-exist.ogg")).lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
