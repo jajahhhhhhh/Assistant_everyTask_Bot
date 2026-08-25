@@ -821,6 +821,7 @@ class LineWebhookHandler:
         classifier: Optional[Callable[[Optional[str]], Any]] = None,
         owner_user_id: str = OWNER_LINE_USER_ID,
         log_bot_acks: bool = LOG_BOT_ACKS,
+        reno: Optional[Any] = None,
     ):
         self.db_path = db_path
         self.channel_secret = channel_secret
@@ -828,6 +829,8 @@ class LineWebhookHandler:
         self.classifier = classifier or classify_message
         self.owner_user_id = owner_user_id
         self.log_bot_acks = log_bot_acks
+        # สะพานไป Reno Dashboard (reno_bridge.RenoBridge) — ไม่ใส่ก็ทำงานได้ตามปกติ
+        self.reno = reno
         self._tasks: set[asyncio.Task] = set()
 
     # ── จังหวะ 0-3: ในคำขอ HTTP ─────────────────────────────────────────────
@@ -977,6 +980,14 @@ class LineWebhookHandler:
                 if command_reply:
                     replies.append(command_reply)
 
+                # จังหวะ 6b — ส่งต่อให้ Reno Dashboard คิดต่อ (งาน/เงิน/สต็อก)
+                # อยู่หลังจังหวะ 5 เสมอ: การปลดการรอเป็นข้อเท็จจริงของแชท ส่วน
+                # รายการที่เดาได้จากข้อความยังต้องรอเจ้าของยืนยันก่อนเข้า dashboard
+                if self.reno is not None:
+                    reno_reply = await asyncio.to_thread(self._run_reno, conn, job)
+                    if reno_reply:
+                        replies.append(reno_reply)
+
             elif job.kind in ("follow", "join"):
                 replies.append(WELCOME_TEXT)
 
@@ -1073,6 +1084,34 @@ class LineWebhookHandler:
 
         return None
 
+    def _run_reno(self, conn: sqlite3.Connection, job: _Job) -> Optional[str]:
+        """คำสั่ง reno ของเจ้าของมาก่อน แล้วค่อยให้ตัวแยกอ่านข้อความธรรมดา"""
+        try:
+            if self.owner_user_id and job.line_user_id == self.owner_user_id:
+                handled = self.reno.handle_command(conn, job.text)
+                if handled:
+                    return handled
+                if parse_owner_command(job.text):
+                    # จังหวะ 6 สร้างงานให้แล้ว ไม่ต้องให้ bridge เสนอซ้ำอีกใบ
+                    return None
+            sender = None
+            if job.contact_id is not None and job.line_user_id != self.owner_user_id:
+                row = conn.execute(
+                    "SELECT display_name FROM contacts WHERE id = ?", (job.contact_id,)
+                ).fetchone()
+                sender = row["display_name"] if row else None
+            return self.reno.on_message(
+                conn,
+                chat_message_id=job.message_id,
+                text=job.text,
+                sent_at=job.sent_at,
+                sender=sender,
+            )
+        except Exception:
+            # สะพานพังต้องไม่ลาก webhook ลงไปด้วย ข้อความยังถูกบันทึกครบแล้ว
+            logger.exception("reno bridge ล้มเหลวสำหรับข้อความ %s", job.message_id)
+            return None
+
     async def _respond(self, conn: sqlite3.Connection, job: _Job, text: str) -> None:
         """จังหวะ 7 — ส่งก่อน แล้วค่อยบันทึก
 
@@ -1164,6 +1203,28 @@ WELCOME_TEXT = (
 # APP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _build_reno_bridge():
+    """เปิดสะพาน Reno Dashboard เมื่อ RENO_BRIDGE=1 (ดู RENO_BRIDGE.md)"""
+    if os.getenv("RENO_BRIDGE", "0") != "1":
+        return None
+    try:
+        import reno_bridge
+    except ImportError:
+        logger.error("ตั้ง RENO_BRIDGE=1 แต่ import reno_bridge ไม่ได้")
+        return None
+
+    bridge = reno_bridge.RenoBridge(
+        auto_approve=os.getenv("RENO_AUTO_APPROVE", "0") == "1"
+    )
+    conn = connect(DB_PATH)
+    try:
+        bridge.ensure_schema(conn)
+    finally:
+        conn.close()
+    logger.info("Reno bridge พร้อมใช้งาน (dashboard: %s)", bridge.config["dashboard_path"])
+    return bridge
+
+
 async def _health(request: web.Request) -> web.Response:
     """สุขภาพของ webhook = ตัวชี้บน tasks ตรงกับ task_blocks ไหม (E3)"""
     handler: LineWebhookHandler = request.app["line_handler"]
@@ -1185,6 +1246,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
             db_path=DB_PATH,
             channel_secret=LINE_CHANNEL_SECRET,
             client=LineClient(LINE_CHANNEL_ACCESS_TOKEN),
+            reno=_build_reno_bridge(),
         )
 
     app = web.Application(client_max_size=MAX_BODY_BYTES)

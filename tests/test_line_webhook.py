@@ -544,5 +544,97 @@ class TestViewsSeeWhatWeWrite(WebhookCase):
         self.assertAlmostEqual(spans[0]["wait_hours"], 6.0, places=1)
 
 
+class TestRenoBridgeWiring(WebhookCase):
+    """LINE → chat_messages → คิวของ reno_bridge → ยืนยัน — ผ่าน webhook จริง"""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        import reno_bridge
+
+        self.rb = reno_bridge
+        config = reno_bridge.load_config("/nonexistent/CONFIG.md")
+        self.handler.reno = reno_bridge.RenoBridge(config)
+        conn = lw.connect(self.db_path)
+        try:
+            self.handler.reno.ensure_schema(conn)
+        finally:
+            conn.close()
+
+    def inbox(self, status="pending"):
+        conn = lw.connect(self.db_path)
+        try:
+            return self.rb.get_inbox(conn, status)
+        finally:
+            conn.close()
+
+    async def test_message_from_the_contractor_lands_in_the_queue(self):
+        await self.post(
+            [message_event(event_id="rb1", user_id=FARID,
+                           text="ขอเบิกค่าแรงงานระบบไฟ 15,000 บาท ตึกเฉวง")]
+        )
+
+        items = self.inbox()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["kind"], "payment")
+        self.assertEqual(items[0]["site"], "Chaweng")
+        self.assertEqual(items[0]["payload"]["amount"], 15000)
+        self.assertEqual(items[0]["payload"]["who"], "Farid")  # ชื่อผู้ส่งจริง ไม่ใช่ค่าเริ่มต้น
+        self.assertIn("จับได้", self.line.replies[0][1])
+
+    async def test_nothing_is_written_to_the_dashboard_before_the_owner_confirms(self):
+        await self.post(
+            [message_event(event_id="rb2", user_id=FARID, text="ขอเบิกค่าแรง 8,000 บาท")]
+        )
+        self.assertEqual(self.inbox("approved"), [])
+
+        item_id = self.inbox()[0]["id"]
+        await self.post(
+            [message_event(event_id="rb3", user_id=OWNER, text=f"reno site #{item_id} เฉวง",
+                           at="2026-08-20T10:05:00Z")]
+        )
+        await self.post(
+            [message_event(event_id="rb4", user_id=OWNER, text="reno ok",
+                           at="2026-08-20T10:06:00Z")]
+        )
+        self.assertEqual(len(self.inbox("approved")), 1)
+
+    async def test_reno_failure_does_not_break_the_webhook(self):
+        class Exploding:
+            def handle_command(self, *a, **k):
+                raise RuntimeError("boom")
+
+            def on_message(self, *a, **k):
+                raise RuntimeError("boom")
+
+        self.handler.reno = Exploding()
+        response, _ = await self.post(
+            [message_event(event_id="rb5", user_id=FARID, text="ขอเบิกค่าแรง 8,000 บาท")]
+        )
+        self.assertEqual(response.status, 200)
+        # ข้อความยังถูกบันทึกครบ และ event ไม่ถูกทำเครื่องหมายว่าล้มเหลว
+        self.assertEqual(len(self.query("SELECT id FROM chat_messages")), 1)
+        self.assertEqual(
+            self.query("SELECT status FROM line_webhook_deliveries")[0]["status"], "processed"
+        )
+
+    async def test_owner_task_command_is_not_queued_twice(self):
+        await self.post(
+            [message_event(event_id="rb7", user_id=OWNER, text="งาน: ติดตั้งสุขภัณฑ์ลิปะ")]
+        )
+        # จังหวะ 6 สร้าง task ให้แล้ว bridge ต้องไม่เสนอการ์ดใบเดียวกันซ้ำ
+        self.assertEqual(len(self.query("SELECT id FROM tasks WHERE id > 1")), 1)
+        self.assertEqual(self.inbox(), [])
+
+    async def test_the_wait_is_still_released_when_reno_also_runs(self):
+        self.open_wait()
+        await self.post(
+            [message_event(event_id="rb6", user_id=FARID,
+                           text="รื้อฝ้าชั้น 2 เฉวงเสร็จแล้วครับ")]
+        )
+        self.assertIsNotNone(self.query("SELECT * FROM task_blocks")[0]["unblocked_at"])
+        self.assertTrue(self.inbox())
+        self.assert_no_pointer_drift()
+
+
 if __name__ == "__main__":
     unittest.main()

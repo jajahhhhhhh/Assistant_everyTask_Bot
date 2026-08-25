@@ -130,10 +130,23 @@ python line_webhook.py    # ฟังที่ $PORT พาธ $LINE_WEBHOOK_PAT
 ตั้ง Webhook URL ใน LINE Developers เป็น `https://<โดเมน>/webhook/line`
 แล้วเปิด Use webhook (ปิด Auto-reply messages ไว้)
 
+### ต่อกับ Reno Dashboard
+
+`reno_bridge.py` แปลงข้อความ LINE ที่ webhook เก็บไว้ เป็นงาน/รายการเงิน/สต็อก
+ของ Dashboard J แล้วพักไว้ในคิวให้เจ้าของยืนยันก่อนเขียนจริง — สกิล `reno-*`
+เรียกผ่าน CLI ของไฟล์นี้ รายละเอียดทั้งหมดอยู่ใน [RENO_BRIDGE.md](RENO_BRIDGE.md)
+
+```bash
+export RENO_BRIDGE=1
+python reno_bridge.py pending --json
+python reno_bridge.py approve --ids 3,4
+python reno_bridge.py apply --dashboard-dir ~/reno-dashboard
+```
+
 ### เทสต์
 
 ```bash
-python -m pytest tests/test_line_webhook.py     # หรือ python -m unittest tests.test_line_webhook
+python -m pytest tests/test_line_webhook.py tests/test_reno_bridge.py
 ```
 
 เทสต์รัน `sql/01_schema.sql` และ `sql/02_views.sql` จริงบนไฟล์ชั่วคราว แล้วอ่านผล
