@@ -160,6 +160,42 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/healthz/invariants")
         self.assertEqual(response.status, 200)
 
+    async def test_storage_reports_where_the_database_lives(self):
+        """ไม่มีทางเข้า shell ของคอนเทนเนอร์ ต้องถามจากในแอปว่า volume ติดไหม"""
+        response = await self.client.get("/healthz/storage")
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+
+        self.assertEqual(body["db_path"], str(Path(self.db_path).resolve()))
+        self.assertTrue(body["exists"])
+        self.assertGreater(body["size_bytes"], 0)
+        # ตัวชี้ขาดว่า volume mount ติดหรือยัง
+        self.assertIn("on_separate_device", body)
+        self.assertIn("predates_this_process", body)
+
+    async def test_storage_counts_what_is_actually_stored(self):
+        """ตัวเลขต้องขยับตามข้อมูลจริง ไม่งั้นดูไม่ออกว่าข้อมูลรอด deploy ไหม"""
+        before = (await (await self.client.get("/healthz/storage")).json())["rows"]
+        self.assertEqual(before["tasks"], 0)
+
+        self.introduce_drift()   # เขียนงานหนึ่งแถวลงฐานข้อมูลจริง
+
+        after = (await (await self.client.get("/healthz/storage")).json())["rows"]
+        self.assertEqual(after["tasks"], 1)
+
+    async def test_storage_survives_a_database_that_has_no_tables_yet(self):
+        """ตารางยังไม่ถูกสร้างต้องได้ null ไม่ใช่ทั้ง endpoint พัง"""
+        empty = str(Path(self._tmp.name) / "empty.db")
+        sqlite3.connect(empty).close()
+        snapshot = lw._storage_snapshot(empty)
+        self.assertTrue(snapshot["exists"])
+        self.assertIsNone(snapshot["rows"]["tasks"])
+
+    async def test_storage_reports_a_missing_database_without_crashing(self):
+        snapshot = lw._storage_snapshot(str(Path(self._tmp.name) / "never-created.db"))
+        self.assertFalse(snapshot["exists"])
+        self.assertEqual(snapshot["rows"], {})
+
     async def test_healthz_survives_concurrent_probes(self):
         """คำขอซ้อนกันต้องไม่ทำให้ 500
 

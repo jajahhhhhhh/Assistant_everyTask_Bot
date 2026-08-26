@@ -55,6 +55,10 @@ from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 logger = logging.getLogger(__name__)
 
+# เวลาที่โปรเซสนี้เริ่ม — /healthz/storage เอาไปเทียบกับเวลาแก้ไขไฟล์ฐานข้อมูล
+# ไฟล์ที่เก่ากว่าโปรเซส แปลว่ารอดข้าม deploy มาได้ คือ volume ทำงานจริง
+PROCESS_STARTED_AT = time.time()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1306,6 +1310,75 @@ async def _invariants(request: web.Request) -> web.Response:
     )
 
 
+def _storage_snapshot(db_path: str) -> Dict[str, Any]:
+    """สำรวจว่าไฟล์ฐานข้อมูลอยู่ที่ไหนและมีอะไรอยู่ — จบในเธรดเดียว"""
+    directory = os.path.dirname(os.path.abspath(db_path)) or "/"
+    report: Dict[str, Any] = {
+        "db_path": os.path.abspath(db_path),
+        "data_dir": directory,
+        "exists": os.path.exists(db_path),
+    }
+
+    # volume ของ Railway ถูก mount เป็นอุปกรณ์คนละตัวกับ root filesystem
+    # ถ้า st_dev ตรงกับของ / แปลว่ายังเขียนลงดิสก์ชั่วคราวที่หายทุก deploy
+    try:
+        report["on_separate_device"] = os.stat(directory).st_dev != os.stat("/").st_dev
+    except OSError as exc:
+        report["on_separate_device"] = None
+        report["device_error"] = str(exc)
+
+    if report["exists"]:
+        stat = os.stat(db_path)
+        report["size_bytes"] = stat.st_size
+        report["modified_at"] = _iso(stat.st_mtime)
+        # ไฟล์เก่ากว่าโปรเซสนี้ = รอดข้าม deploy มา = volume ทำงานจริง
+        report["predates_this_process"] = stat.st_mtime < PROCESS_STARTED_AT
+
+    report["process_started_at"] = _iso(PROCESS_STARTED_AT)
+    report["rows"] = _row_counts(db_path) if report["exists"] else {}
+    return report
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+COUNTED_TABLES = ("tasks", "chat_messages", "chat_threads", "reminders", "notes")
+
+
+def _row_counts(db_path: str) -> Dict[str, Any]:
+    """นับแถวเท่าที่นับได้ ตารางที่ยังไม่มีก็ข้ามไป ไม่ทำให้ทั้ง endpoint พัง"""
+    counts: Dict[str, Any] = {}
+    try:
+        conn = connect(db_path)
+    except sqlite3.Error as exc:
+        return {"error": str(exc)}
+    try:
+        for table in COUNTED_TABLES:
+            try:
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.Error:
+                counts[table] = None      # ตารางยังไม่ถูกสร้าง
+    finally:
+        conn.close()
+    return counts
+
+
+async def _storage(request: web.Request) -> web.Response:
+    """ฐานข้อมูลอยู่ที่ไหน อยู่บน volume จริงไหม และมีอะไรอยู่ในนั้นบ้าง
+
+    ไม่มีทางเข้า shell ของคอนเทนเนอร์บน Railway การจะรู้ว่า volume mount ติดจริง
+    ไหมจึงต้องถามจากในแอปเอง ตัวชี้ขาดคือ on_separate_device — volume ถูก mount
+    เป็นอุปกรณ์คนละตัวกับ root filesystem ถ้าเป็น false แปลว่ายังเขียนลงดิสก์
+    ชั่วคราวที่หายทุก deploy อยู่
+
+    ตอบ 200 เสมอ นี่คือรายงาน ไม่ใช่ health check — Railway ผูกอยู่กับ /healthz
+    """
+    handler: LineWebhookHandler = request.app["line_handler"]
+    snapshot = await asyncio.to_thread(_storage_snapshot, handler.db_path)
+    return web.json_response(snapshot)
+
+
 def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     if handler is None:
         init_webhook_tables(DB_PATH)
@@ -1321,6 +1394,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     app.router.add_post(WEBHOOK_PATH, handler.handle)
     app.router.add_get("/healthz", _health)
     app.router.add_get("/healthz/invariants", _invariants)
+    app.router.add_get("/healthz/storage", _storage)
 
     async def _cleanup(app: web.Application) -> None:
         await app["line_handler"].close()
