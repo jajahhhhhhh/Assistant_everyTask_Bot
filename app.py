@@ -67,6 +67,17 @@ async def start_telegram():
     return application
 
 
+def data_dir_is_persistent(path: str) -> bool:
+    """โฟลเดอร์นี้อยู่บนอุปกรณ์คนละตัวกับ root filesystem หรือไม่
+
+    volume ของ Railway ถูก mount เป็นอุปกรณ์แยก การเทียบ st_dev กับของ / จึง
+    บอกได้ว่าข้อมูลจะรอด deploy ไหม แยกออกมาเป็นฟังก์ชันของตัวเองเพราะผลของมัน
+    ขึ้นกับสภาพเครื่องที่รัน เทสต์จึงต้องกำหนดคำตอบเองได้ ไม่งั้นจะได้เทสต์ที่
+    ผ่านหรือแดงตามว่า /tmp ของเครื่องนั้นเป็น tmpfs หรือเปล่า
+    """
+    return os.stat(path).st_dev != os.stat("/").st_dev
+
+
 def describe_storage() -> None:
     """บอกตอนบูตว่าข้อมูลจะไปอยู่ที่ไหนจริง ๆ
 
@@ -116,7 +127,7 @@ def describe_storage() -> None:
     while not os.path.exists(probe) and os.path.dirname(probe) != probe:
         probe = os.path.dirname(probe)
     try:
-        persistent = os.stat(probe).st_dev != os.stat("/").st_dev
+        persistent = data_dir_is_persistent(probe)
     except OSError as exc:
         logger.warning("ตรวจไม่ได้ว่า %s อยู่บน volume หรือไม่: %s", directory, exc)
         return

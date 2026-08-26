@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -137,14 +138,21 @@ class TestBootStorageReport(unittest.TestCase):
                 os.environ[key] = value
         self._tmp.cleanup()
 
-    def report(self, db_path=None):
+    def report(self, db_path=None, on_volume=False):
+        """รันรายงาน โดยกำหนดผลของการเทียบ device เอง
+
+        ผลจริงขึ้นกับว่าเครื่องที่รันเทสต์ mount /tmp แยกหรือไม่ — เครื่องนี้ไม่แยก
+        แต่ runner หลายตัว /tmp เป็น tmpfs คนละอุปกรณ์ ปล่อยให้ขึ้นกับสภาพเครื่อง
+        เท่ากับเขียนเทสต์ที่ผ่านหรือแดงตามว่าไปรันที่ไหน
+        """
         import bot
 
         original = bot.DB_PATH
         bot.DB_PATH = db_path or lw.DB_PATH
         try:
-            with self.assertLogs("app", level="INFO") as captured:
-                app.describe_storage()
+            with mock.patch.object(app, "data_dir_is_persistent", return_value=on_volume):
+                with self.assertLogs("app", level="INFO") as captured:
+                    app.describe_storage()
             return "\n".join(captured.output)
         finally:
             bot.DB_PATH = original
@@ -172,9 +180,33 @@ class TestBootStorageReport(unittest.TestCase):
         self.assertIn("คนละไฟล์", output)
 
     def test_warns_when_the_data_directory_is_not_a_volume(self):
-        """โฟลเดอร์ชั่วคราวอยู่บน device เดียวกับ / — ต้องเตือนว่าข้อมูลจะหาย"""
-        output = self.report()
+        output = self.report(on_volume=False)
+        self.assertIn("WARNING", output)
         self.assertIn("จะหายเมื่อ deploy", output)
+
+    def test_says_so_when_the_data_directory_is_a_volume(self):
+        """สาขาที่ควรเกิดหลังตั้งค่าถูก — ต้องยืนยันให้เห็น ไม่ใช่เงียบ"""
+        output = self.report(on_volume=True)
+        self.assertIn("อยู่บน volume", output)
+        self.assertNotIn("จะหายเมื่อ deploy", output)
+
+    def test_the_device_check_reads_the_real_filesystem(self):
+        """ฟังก์ชันที่เทสต์อื่น mock ไว้ ต้องมีตัวหนึ่งที่ยืนยันของจริง
+
+        ไม่งั้น mock ทุกที่แล้วไม่มีใครตรวจว่าการเทียบ st_dev ทำงานถูกจริง
+        """
+        self.assertFalse(app.data_dir_is_persistent("/"))
+
+        # หาโฟลเดอร์ที่อยู่คนละอุปกรณ์กับ / จริง ๆ — ไม่ผูกกับ path ใด path หนึ่ง
+        # เพราะเครื่องต่างกัน mount ไม่เหมือนกัน
+        elsewhere = next(
+            (p for p in ("/proc", "/sys", "/dev", "/dev/shm", "/run")
+             if os.path.exists(p) and os.stat(p).st_dev != os.stat("/").st_dev),
+            None,
+        )
+        if elsewhere is None:
+            self.skipTest("เครื่องนี้ไม่มี filesystem แยกให้ทดสอบสาขาบวก")
+        self.assertTrue(app.data_dir_is_persistent(elsewhere))
 
     def test_still_answers_when_the_directory_does_not_exist_yet(self):
         """โฟลเดอร์ข้อมูลถูกสร้างใน start_web() ซึ่งรันหลังจากนี้
