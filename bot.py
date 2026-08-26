@@ -1011,10 +1011,15 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
+    # ค่าเริ่มต้นของ .get() ใช้ได้แค่ตอน "ไม่มีคีย์" แต่คอลัมน์ในฐานข้อมูลเป็น NULL
+    # ได้ ซึ่งคืน None มา แล้ว None[:20] โยน TypeError — เกิดจริงเมื่อผู้ใช้เลือก
+    # sheets แล้วยังไม่ได้ใส่ id ส่วน escape_code(None) ก็คืนช่องว่างเปล่า ๆ
     if storage_type == "airtable":
-        text += f"Base: `{escape_code(settings.get('airtable_base_id', 'N/A'))}`"
+        base_id = settings.get("airtable_base_id") or "ยังไม่ได้ตั้ง"
+        text += f"Base: `{escape_code(base_id)}`"
     elif storage_type == "sheets":
-        text += f"Sheet: `{escape_code(settings.get('google_sheet_id', 'N/A')[:20])}...`"
+        sheet_id = settings.get("google_sheet_id")
+        text += f"Sheet: `{escape_code(sheet_id[:20] + '...' if sheet_id else 'ยังไม่ได้ตั้ง')}`"
     
     text += "\n\n💡 Use /settings to change"
     

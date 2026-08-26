@@ -109,6 +109,32 @@ class TestCommandsEscapeWhatTheyEcho(BotDbCase):
         self.assertIn("\\*\\*\\*", reply["text"])
 
 
+class TestMyStorageSurvivesNulls(BotDbCase):
+    """คอลัมน์ในฐานข้อมูลเป็น NULL ได้ ค่าเริ่มต้นของ .get() ช่วยไม่ได้
+
+    .get(key, default) คืน default เฉพาะตอน "ไม่มีคีย์" แต่แถวในฐานข้อมูลมีคีย์
+    ครบเสมอ เพียงแต่ค่าเป็น None ได้ แล้ว None[:20] โยน TypeError ส่วน
+    escape_code(None) ก็คืนช่องว่างเปล่า ๆ แทนที่จะบอกว่ายังไม่ได้ตั้ง
+    """
+
+    async def show(self):
+        update = FakeUpdate()
+        await bot.mystorage_command(update, FakeContext())
+        return update.message.replies[-1]["text"]
+
+    async def test_sheets_without_an_id_does_not_crash(self):
+        bot.StorageSettings.set_storage_type(USER_A, "sheets")
+        self.assertIn("ยังไม่ได้ตั้ง", await self.show())
+
+    async def test_airtable_without_a_base_says_so_instead_of_blank(self):
+        bot.StorageSettings.set_storage_type(USER_A, "airtable")
+        self.assertIn("ยังไม่ได้ตั้ง", await self.show())
+
+    async def test_a_configured_sheet_is_shown_truncated(self):
+        bot.StorageSettings.set_google_sheets(USER_A, "1" * 40)
+        self.assertIn("1" * 20 + "...", await self.show())
+
+
 class TestNoUnescapedUserTextRemains(unittest.TestCase):
     """กันไม่ให้มีจุดใหม่หลุดไป
 
@@ -140,7 +166,7 @@ class TestNoUnescapedUserTextRemains(unittest.TestCase):
         import ast
         from pathlib import Path
 
-        tree = ast.parse(Path(bot.__file__).read_text())
+        tree = ast.parse(Path(bot.__file__).read_text(encoding="utf-8"))
         offenders = []
 
         for node in ast.walk(tree):
@@ -158,7 +184,11 @@ class TestNoUnescapedUserTextRemains(unittest.TestCase):
             if not markdown:
                 continue
 
-            for arg in node.args:
+            # ตรวจทั้ง positional และ keyword — reply_text(text=f"...") ต้องไม่หลุด
+            candidates = list(node.args) + [
+                kw.value for kw in node.keywords if kw.arg != "parse_mode"
+            ]
+            for arg in candidates:
                 for piece in ast.walk(arg):
                     if not isinstance(piece, ast.FormattedValue):
                         continue
@@ -174,6 +204,25 @@ class TestNoUnescapedUserTextRemains(unittest.TestCase):
             "มีค่าที่ส่งลง Markdown โดยไม่ผ่าน escape — ถ้าปลอดภัยจริงให้เพิ่มเข้า "
             "ALLOWED_BARE พร้อมคอมเมนต์บอกเหตุผล",
         )
+
+    def test_the_guard_covers_keyword_arguments_too(self):
+        """reply_text(text=f"...") ต้องไม่หลุดตัวกันไปได้"""
+        import ast
+
+        tree = ast.parse(
+            'update.message.reply_text(text=f"hi {title}", parse_mode="Markdown")'
+        )
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call))
+        candidates = list(call.args) + [
+            kw.value for kw in call.keywords if kw.arg != "parse_mode"
+        ]
+        found = [
+            ast.unparse(p.value)
+            for arg in candidates
+            for p in ast.walk(arg)
+            if isinstance(p, ast.FormattedValue)
+        ]
+        self.assertEqual(found, ["title"])
 
     def test_the_guard_would_notice_a_new_offender(self):
         """ตัวกันที่จับอะไรไม่ได้เลย ก็ไม่ต่างจากไม่มี"""
