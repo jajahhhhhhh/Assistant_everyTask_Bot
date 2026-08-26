@@ -28,6 +28,20 @@ class BotDbCase(unittest.IsolatedAsyncioTestCase):
         bot.DB_PATH = self._original_db_path
         self._tmp.cleanup()
 
+    def add_project(self, name, kind="personal"):
+        """projects.type มี CHECK ห้าค่า เทสต์จึงต้องใส่ค่าที่ผ่านจริง"""
+        import sqlite3
+
+        conn = sqlite3.connect(bot.DB_PATH)
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO projects (name, type) VALUES (?, ?)", (name, kind)
+                )
+                return int(cursor.lastrowid)
+        finally:
+            conn.close()
+
     def rows(self, sql, params=()):
         import sqlite3
 
