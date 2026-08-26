@@ -48,6 +48,31 @@ Just send any voice message → Auto-transcribed by AI!
 | `TELEGRAM_BOT_TOKEN` | ✅ | From @BotFather |
 | `OPENAI_API_KEY` | ✅ | For translation & transcription |
 | `DATA_DIR` | ❌ | Default: `data` |
+| `GOOGLE_CLIENT_ID` | ❌ | เปิดตัวเลือก Google Drive ใน `/settings` |
+| `GOOGLE_CLIENT_SECRET` | ❌ | คู่กับ `GOOGLE_CLIENT_ID` |
+| `PUBLIC_BASE_URL` | ❌ | URL สาธารณะของบริการ ใช้ประกอบ redirect ของ OAuth |
+
+## Google Drive (ไม่บังคับ)
+
+ผู้ใช้เลือก Drive ได้จาก `/settings` แล้วงาน การเตือน และโน้ตของคนนั้นจะถูกส่ง
+สำเนาขึ้นไปเป็นไฟล์ JSON ไฟล์เดียวในโฟลเดอร์ `Assistant everyTask Bot`
+
+**SQLite ยังเป็นต้นฉบับเสมอ Drive เป็นสำเนา** — ตัวส่งการเตือนกับ `/done` อ้าง
+rowid ของ SQLite ถ้าย้ายต้นฉบับไป Drive สองอย่างนั้นพังทันที และการเขียนที่ล้ม
+กลางทางจะกลายเป็นข้อมูลหาย ไม่ใช่แค่สำเนาไม่ตรง ส่งขึ้นไม่สำเร็จบอทจะบอกในแชต
+ไม่เงียบ
+
+ตั้งค่าฝั่งเจ้าของบอทครั้งเดียว:
+
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) →
+   Create Credentials → OAuth client ID → Web application
+2. Authorized redirect URI ใส่ `https://<โดเมน>/oauth/google/callback`
+3. เอา Client ID / Client Secret ไปตั้งเป็น `GOOGLE_CLIENT_ID` /
+   `GOOGLE_CLIENT_SECRET` และตั้ง `PUBLIC_BASE_URL=https://<โดเมน>`
+
+ผู้ใช้แต่ละคนแค่กด `/settings` → 📁 Google Drive → กดปุ่มอนุญาต **ไม่มี
+credential ตัวไหนต้องพิมพ์ลงแชต** ลิงก์ยินยอมหมดอายุใน 15 นาที และขอสิทธิ์แค่
+`drive.file` คือเห็นเฉพาะไฟล์ที่บอทสร้างเอง ไม่ใช่ทั้งไดรฟ์
 
 ## Deploy to Railway
 
@@ -66,6 +91,7 @@ SQLite ไฟล์เดียวกัน และ volume ของ Railway �
    | `OPENAI_API_KEY` | แปลภาษา + ถอดเสียงใน Telegram bot |
    | `DATA_DIR` | ตั้งเป็น `/data` ให้ตรงกับ volume (ดูข้อ 3) |
    | `RENO_BRIDGE` | `1` ถ้าจะต่อกับ Reno Dashboard (ดู [RENO_BRIDGE.md](RENO_BRIDGE.md)) |
+   | `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` + `PUBLIC_BASE_URL` | เปิด Google Drive ใน `/settings` |
 
    `PORT` Railway ใส่ให้เอง ไม่ต้องตั้ง
 

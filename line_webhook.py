@@ -40,6 +40,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import inspect
 import json
 import logging
@@ -49,7 +50,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -88,6 +89,19 @@ LOG_BOT_ACKS = os.getenv("LINE_LOG_BOT_ACKS", "0") == "1"
 # บริการนี้ต้องเปิดสู่อินเทอร์เน็ตอยู่แล้วเพราะ LINE ต้องยิง webhook เข้ามาได้
 # ถ้าไม่ตั้งค่านี้ endpoint จะไม่มีอยู่เลย
 STORAGE_REPORT_TOKEN = os.getenv("STORAGE_REPORT_TOKEN", "")
+
+# OAuth ของ Google Drive — client เป็นของเจ้าของบอท ผู้ใช้แค่กดยินยอม
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+GOOGLE_OAUTH_CALLBACK_PATH = "/oauth/google/callback"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+# ขอสิทธิ์แคบที่สุดที่ยังทำงานได้ — drive.file ให้เห็นเฉพาะไฟล์ที่แอปนี้สร้างเอง
+# ไม่ใช่ทั้งไดรฟ์ของผู้ใช้
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+# ลิงก์ยินยอมมีอายุสั้น ๆ กันคนอื่นเก็บลิงก์เก่าไปผูกไดรฟ์ตัวเองกับบัญชีคนอื่น
+OAUTH_STATE_TTL_SECONDS = 15 * 60
 
 MAX_BODY_BYTES = 512 * 1024
 
@@ -1405,6 +1419,151 @@ def _row_counts(db_path: str) -> Dict[str, Any]:
     return counts
 
 
+def _oauth_state_secret() -> bytes:
+    """กุญแจเซ็น state — ใช้ client secret ที่มีอยู่แล้วฝั่งเซิร์ฟเวอร์"""
+    return GOOGLE_CLIENT_SECRET.encode("utf-8")
+
+
+def make_oauth_state(user_id: int, issued_at: Optional[float] = None) -> str:
+    """เซ็น Telegram user id ลงใน state ของ OAuth
+
+    ถ้า state เป็น user id เปล่า ๆ ใครก็ยิง callback พร้อม id ของคนอื่นเพื่อผูก
+    Drive ตัวเองเข้ากับบัญชีคนนั้นได้ ลายเซ็นทำให้ปลอม id ไม่ได้ และเวลาที่ฝัง
+    มาด้วยทำให้ลิงก์เก่าหมดอายุ
+    """
+    stamp = int(time.time() if issued_at is None else issued_at)
+    body = f"{user_id}.{stamp}"
+    sig = hmac.new(_oauth_state_secret(), body.encode("utf-8"), hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+    return f"{body}.{token}"
+
+
+def verify_oauth_state(state: str, now: Optional[float] = None) -> Optional[int]:
+    """คืน user id ถ้าลายเซ็นถูกและยังไม่หมดอายุ ไม่งั้นคืน None"""
+    if not GOOGLE_CLIENT_SECRET:
+        return None
+    parts = state.split(".")
+    if len(parts) != 3:
+        return None
+    raw_user, raw_stamp, _ = parts
+    expected = make_oauth_state_from_parts(raw_user, raw_stamp)
+    if expected is None or not hmac.compare_digest(expected, state):
+        return None
+    try:
+        stamp = int(raw_stamp)
+        user_id = int(raw_user)
+    except ValueError:
+        return None
+    current = time.time() if now is None else now
+    if current - stamp > OAUTH_STATE_TTL_SECONDS:
+        return None
+    return user_id
+
+
+def make_oauth_state_from_parts(raw_user: str, raw_stamp: str) -> Optional[str]:
+    """ประกอบ state ที่ควรจะเป็นขึ้นมาใหม่เพื่อเทียบ — ไม่แปลงชนิดก่อนเทียบ
+
+    เทียบจากสตริงดิบที่ส่งมา ไม่ใช่จาก int ที่แปลงแล้ว มิฉะนั้น "007" กับ "7"
+    จะให้ลายเซ็นคนละอันแต่ผ่านทั้งคู่
+    """
+    body = f"{raw_user}.{raw_stamp}"
+    sig = hmac.new(_oauth_state_secret(), body.encode("utf-8"), hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+    return f"{body}.{token}"
+
+
+def google_consent_url(user_id: int) -> Optional[str]:
+    """ลิงก์ที่ส่งให้ผู้ใช้กดยินยอม — None ถ้ายังตั้งค่า OAuth ไม่ครบ"""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and PUBLIC_BASE_URL):
+        return None
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": f"{PUBLIC_BASE_URL}{GOOGLE_OAUTH_CALLBACK_PATH}",
+        "response_type": "code",
+        "scope": GOOGLE_DRIVE_SCOPE,
+        # ต้องมีทั้งสองตัวถึงจะได้ refresh token กลับมา ไม่งั้นได้แค่ access token
+        # ที่หมดอายุในหนึ่งชั่วโมงแล้วต่อใหม่ไม่ได้
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": make_oauth_state(user_id),
+    }
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+def _oauth_page(message: str, status: int = 200) -> web.Response:
+    """หน้าเปล่า ๆ ที่ผู้ใช้เห็นหลังกดยินยอม — ไม่มีอะไรลับอยู่ในนั้น
+
+    escape ข้อความก่อนเสมอ ตอนนี้ผู้เรียกทุกที่ส่งข้อความคงที่ของเราเองจึงยังไม่มี
+    ช่องโหว่จริง แต่ฟังก์ชันนี้รับ str อะไรก็ได้ วันที่มีใครส่งข้อความ error ที่มี
+    ส่วนผสมจากภายนอกเข้ามา มันจะกลายเป็นช่องฉีด HTML ทันทีโดยไม่มีอะไรเตือน
+    """
+    body = (
+        "<!doctype html><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Assistant everyTask Bot</title>"
+        "<body style='font-family:system-ui;padding:2rem;line-height:1.6'>"
+        f"<p>{html.escape(message)}</p></body>"
+    )
+    return web.Response(text=body, content_type="text/html", status=status)
+
+
+async def _google_oauth_callback(request: web.Request) -> web.Response:
+    """รับ code จาก Google แลกเป็น refresh token แล้วเก็บให้ผู้ใช้คนนั้น
+
+    ทั้งหมดนี้เกิดนอกแชต Telegram โดยตั้งใจ — วิธีที่ให้ผู้ใช้พิมพ์ token ใส่แชต
+    ทำให้ credential ค้างอยู่ในประวัติแชตถาวร ตรงนี้สิ่งที่วิ่งผ่านมือผู้ใช้มีแค่
+    ลิงก์ที่หมดอายุใน 15 นาที
+    """
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and PUBLIC_BASE_URL):
+        return _oauth_page("ยังไม่ได้ตั้งค่า Google OAuth ฝั่งเซิร์ฟเวอร์", status=503)
+
+    if request.query.get("error"):
+        return _oauth_page("ยกเลิกการเชื่อมต่อแล้ว กลับไปที่ Telegram ได้เลย")
+
+    code = request.query.get("code", "")
+    state = request.query.get("state", "")
+    user_id = verify_oauth_state(state) if state else None
+    if not code or user_id is None:
+        return _oauth_page("ลิงก์ไม่ถูกต้องหรือหมดอายุแล้ว — พิมพ์ /settings ใหม่", status=400)
+
+    payload = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": f"{PUBLIC_BASE_URL}{GOOGLE_OAUTH_CALLBACK_PATH}",
+        "grant_type": "authorization_code",
+    }
+    try:
+        async with ClientSession() as session:
+            async with session.post(GOOGLE_TOKEN_URL, data=payload) as response:
+                if response.status != 200:
+                    logger.warning("แลก code เป็น token ไม่สำเร็จ (%s)", response.status)
+                    return _oauth_page("เชื่อมต่อไม่สำเร็จ ลองใหม่อีกครั้ง", status=502)
+                data = await response.json()
+    except Exception:
+        logger.exception("แลก code เป็น token ไม่สำเร็จ")
+        return _oauth_page("เชื่อมต่อไม่สำเร็จ ลองใหม่อีกครั้ง", status=502)
+
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        # เกิดเมื่อผู้ใช้เคยยินยอมไว้แล้วและ Google ไม่ส่ง refresh token ซ้ำ
+        # prompt=consent ควรกันไว้แล้ว แต่ถ้าหลุดมาก็ต้องบอกให้ชัด ไม่ใช่เก็บ
+        # ค่าว่างแล้วไปพังตอนใช้งานจริง
+        logger.warning("Google ไม่ส่ง refresh token กลับมา (user %s)", user_id)
+        return _oauth_page(
+            "Google ไม่ได้ส่งสิทธิ์ระยะยาวกลับมา — ถอนสิทธิ์แอปนี้ที่ "
+            "myaccount.google.com/permissions แล้วลองใหม่",
+            status=400,
+        )
+
+    # import ตรงนี้ไม่ใช่บนหัวไฟล์ เพราะ bot.py import โมดูลนี้อยู่ — วนกลับกันไม่ได้
+    import bot
+
+    await asyncio.to_thread(bot.StorageSettings.set_google_drive, user_id, refresh_token)
+    logger.info("ผูก Google Drive ให้ผู้ใช้ %s แล้ว", user_id)
+    return _oauth_page("เชื่อม Google Drive เรียบร้อย กลับไปที่ Telegram ได้เลย ✅")
+
+
 def _storage_token_ok(request: web.Request) -> bool:
     """โทเคนมาทาง header หรือ query ก็ได้ — query ทำให้เปิดจากเบราว์เซอร์ได้เลย"""
     if not STORAGE_REPORT_TOKEN:
@@ -1453,6 +1612,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     app.router.add_get("/healthz", _health)
     app.router.add_get("/healthz/invariants", _invariants)
     app.router.add_get("/healthz/storage", _storage)
+    app.router.add_get(GOOGLE_OAUTH_CALLBACK_PATH, _google_oauth_callback)
 
     async def _cleanup(app: web.Application) -> None:
         await app["line_handler"].close()
