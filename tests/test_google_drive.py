@@ -270,6 +270,24 @@ class TestConsentUrl(unittest.TestCase):
         self.assertIn(line_webhook.GOOGLE_OAUTH_CALLBACK_PATH, paths)
 
 
+class TestOAuthPage(unittest.TestCase):
+    def test_html_in_the_message_is_escaped(self):
+        """ตอนนี้ผู้เรียกทุกที่ส่งข้อความคงที่ แต่ฟังก์ชันรับ str อะไรก็ได้
+
+        กันไว้ก่อนที่จะมีใครส่งข้อความ error ที่มีส่วนผสมจากภายนอกเข้ามา
+        """
+        response = line_webhook._oauth_page("<script>alert(1)</script>")
+        self.assertNotIn("<script>", response.text)
+        self.assertIn("&lt;script&gt;", response.text)
+
+    def test_ordinary_thai_text_survives_intact(self):
+        response = line_webhook._oauth_page("เชื่อม Google Drive เรียบร้อย")
+        self.assertIn("เชื่อม Google Drive เรียบร้อย", response.text)
+
+    def test_the_status_code_is_passed_through(self):
+        self.assertEqual(line_webhook._oauth_page("ไม่ผ่าน", status=400).status, 400)
+
+
 class _DummyHandler:
     db_path = ":memory:"
 

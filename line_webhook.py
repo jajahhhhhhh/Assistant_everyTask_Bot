@@ -40,6 +40,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import inspect
 import json
 import logging
@@ -1490,13 +1491,18 @@ def google_consent_url(user_id: int) -> Optional[str]:
 
 
 def _oauth_page(message: str, status: int = 200) -> web.Response:
-    """หน้าเปล่า ๆ ที่ผู้ใช้เห็นหลังกดยินยอม — ไม่มีอะไรลับอยู่ในนั้น"""
+    """หน้าเปล่า ๆ ที่ผู้ใช้เห็นหลังกดยินยอม — ไม่มีอะไรลับอยู่ในนั้น
+
+    escape ข้อความก่อนเสมอ ตอนนี้ผู้เรียกทุกที่ส่งข้อความคงที่ของเราเองจึงยังไม่มี
+    ช่องโหว่จริง แต่ฟังก์ชันนี้รับ str อะไรก็ได้ วันที่มีใครส่งข้อความ error ที่มี
+    ส่วนผสมจากภายนอกเข้ามา มันจะกลายเป็นช่องฉีด HTML ทันทีโดยไม่มีอะไรเตือน
+    """
     body = (
         "<!doctype html><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>Assistant everyTask Bot</title>"
         "<body style='font-family:system-ui;padding:2rem;line-height:1.6'>"
-        f"<p>{message}</p></body>"
+        f"<p>{html.escape(message)}</p></body>"
     )
     return web.Response(text=body, content_type="text/html", status=status)
 
