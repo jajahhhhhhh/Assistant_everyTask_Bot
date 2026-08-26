@@ -40,6 +40,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+import line_webhook
+
 logger = logging.getLogger(__name__)
 # Silence httpx/httpcore request logs so the bot token never lands in logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -64,26 +66,35 @@ LANGUAGES = {
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _add_missing_columns(cursor):
+    """เติมคอลัมน์ที่เพิ่มเข้ามาทีหลังให้ฐานข้อมูลที่มีอยู่ก่อนแล้ว
+
+    CREATE TABLE IF NOT EXISTS ไม่แตะตารางที่มีอยู่แล้วเลย พอมี volume ถาวร
+    ฐานข้อมูลเดิมจะไม่มีคอลัมน์ใหม่ตลอดไปถ้าไม่ ALTER ให้
+    """
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)")}
+    if "priority" not in columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN priority TEXT")
+
+
 def init_db():
-    """Initialize the SQLite database with all tables"""
+    """สร้างตารางทั้งหมดที่บอทใช้
+
+    ตาราง tasks เป็นของ sql/01_schema.sql ไม่ใช่ของไฟล์นี้ — งานจาก Telegram
+    กับงานจาก LINE อยู่ตารางเดียวกัน แยกความเป็นเจ้าของด้วย source/source_ref
+
+    เดิมไฟล์นี้ประกาศ tasks ของตัวเองที่มี user_id/priority/due_date/project
+    ทั้งสองฝั่งใช้ CREATE TABLE IF NOT EXISTS ใครสร้างก่อนจึงได้ตารางนั้นไป และ
+    app.py เรียก start_web() ก่อน start_telegram() เสมอ ผลคือ /task พังด้วย
+    "table tasks has no column named user_id" มาตลอดโดยไม่มีใครเห็น
+    """
+    line_webhook.init_webhook_tables(DB_PATH)
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Tasks table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            priority TEXT DEFAULT 'medium',
-            status TEXT DEFAULT 'todo',
-            due_date TEXT,
-            project TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
-        )
-    """)
-    
+
+    _add_missing_columns(cursor)
+
     # Reminders table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
@@ -314,43 +325,79 @@ class GoogleSheetsClient:
 # STORAGE MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# งานทุกแถวในตารางกลางบอกที่มาของตัวเองไว้ ค่านี้คือของฝั่ง Telegram
+TELEGRAM_SOURCE = "telegram"
+
+
+def _project_id(conn, name):
+    """หา projects.id จากชื่อ — ไม่สร้างแถวใหม่
+
+    projects.type มี CHECK จำกัดไว้ห้าค่า การเดา type จากข้อความที่พิมพ์ใน
+    Telegram มีแต่จะได้แถวผิดหรือ IntegrityError งานที่อ้างชื่อโปรเจกต์ที่ยัง
+    ไม่มีจึงปล่อย project_id ว่างไว้ ดีกว่าเดา
+    """
+    if not name:
+        return None
+    row = conn.execute(
+        "SELECT id FROM projects WHERE name = ? COLLATE NOCASE", (name,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 class Storage:
     """Routes storage operations to the correct backend"""
     
     @staticmethod
     async def add_task(user_id: int, title: str, priority: str = "medium",
                        due_date: str = None, project: str = None) -> int:
+        """สร้างงานลงตารางกลาง — source='telegram', source_ref = Telegram user id
+
+        source_ref คือสิ่งที่บอกว่างานเป็นของใคร แทนคอลัมน์ user_id เดิม รูปแบบ
+        เดียวกับที่ฝั่ง LINE ใช้ (source='line', source_ref = chat_messages.id)
+        """
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO tasks (user_id, title, priority, due_date, project)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, title, priority, due_date, project))
-        task_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return task_id
+        try:
+            at = line_webhook.utc_now()
+            with conn:
+                cursor = conn.execute("""
+                    INSERT INTO tasks
+                        (title, status, created_at, due_at, priority, project_id,
+                         source, source_ref)
+                    VALUES (?, 'inbox', ?, ?, ?, ?, ?, ?)
+                """, (title, at, due_date, priority, _project_id(conn, project),
+                      TELEGRAM_SOURCE, str(user_id)))
+                task_id = int(cursor.lastrowid)
+                # task_events เป็นบันทึกการเปลี่ยนสถานะที่รายงานทุกตัวอ่าน
+                # ฝั่ง LINE เขียนทุกครั้งที่สร้างงาน ฝั่งนี้จึงต้องเขียนด้วย
+                conn.execute("""
+                    INSERT INTO task_events (task_id, from_status, to_status, at)
+                    VALUES (?, NULL, 'inbox', ?)
+                """, (task_id, at))
+            return task_id
+        finally:
+            conn.close()
     
     @staticmethod
     async def get_tasks(user_id: int, status: str = None) -> List[Dict]:
+        """งานของผู้ใช้คนนี้เท่านั้น — งานที่มาจาก LINE จะไม่ติดมาด้วย"""
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        if status:
-            cursor.execute("""
-                SELECT id, title, priority, status, due_date, project, created_at
-                FROM tasks WHERE user_id = ? AND status = ?
-                ORDER BY created_at DESC
-            """, (user_id, status))
-        else:
-            cursor.execute("""
-                SELECT id, title, priority, status, due_date, project, created_at
-                FROM tasks WHERE user_id = ?
-                ORDER BY created_at DESC
-            """, (user_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        try:
+            sql = """
+                SELECT t.id, t.title, t.priority, t.status, t.due_at, p.name
+                FROM tasks t
+                LEFT JOIN projects p ON p.id = t.project_id
+                WHERE t.source = ? AND t.source_ref = ?
+            """
+            params = [TELEGRAM_SOURCE, str(user_id)]
+            if status:
+                sql += " AND t.status = ?"
+                params.append(status)
+            # created_at ละเอียดระดับวินาที งานที่สร้างวินาทีเดียวกันจึงต้องมี
+            # ตัวตัดสินที่แน่นอน ไม่งั้นลำดับสลับไปมาระหว่างการรัน
+            sql += " ORDER BY t.created_at DESC, t.id DESC"
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
         
         return [
             {
@@ -363,15 +410,26 @@ class Storage:
     @staticmethod
     async def complete_task(user_id: int, task_id: int) -> bool:
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE tasks SET status = 'done', completed_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND user_id = ?
-        """, (task_id, user_id))
-        affected = cursor.rowcount
-        conn.commit()
-        conn.close()
-        return affected > 0
+        try:
+            at = line_webhook.utc_now()
+            with conn:
+                row = conn.execute("""
+                    SELECT status FROM tasks
+                    WHERE id = ? AND source = ? AND source_ref = ?
+                """, (task_id, TELEGRAM_SOURCE, str(user_id))).fetchone()
+                if row is None:
+                    return False
+                if row[0] != "done":
+                    conn.execute("""
+                        UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?
+                    """, (at, task_id))
+                    conn.execute("""
+                        INSERT INTO task_events (task_id, from_status, to_status, at)
+                        VALUES (?, ?, 'done', ?)
+                    """, (task_id, row[0], at))
+            return True
+        finally:
+            conn.close()
     
     @staticmethod
     async def add_reminder(user_id: int, text: str, remind_at: datetime) -> int:
@@ -658,7 +716,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    todo = [t for t in tasks if t["status"] == "todo"]
+    todo = [t for t in tasks if t["status"] == "inbox"]
     doing = [t for t in tasks if t["status"] == "doing"]
     done = [t for t in tasks if t["status"] == "done"]
     

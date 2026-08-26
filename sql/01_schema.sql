@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   note                  TEXT,
   project_id            INTEGER REFERENCES projects(id),
   category              TEXT,          -- เช่น 'คุยผู้รับเหมา','เอกสาร','ของร้าน','โค้ด'
+  priority              TEXT,          -- 'urgent','high','medium','low' — ว่างได้
   status                TEXT NOT NULL DEFAULT 'inbox'
                           CHECK (status IN ('inbox','doing','blocked','done','dropped')),
   created_at            TEXT NOT NULL,
