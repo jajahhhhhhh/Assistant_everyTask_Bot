@@ -400,6 +400,35 @@ class Storage:
         return [{"id": r[0], "text": r[1], "remind_at": r[2], "status": r[3]} for r in rows]
     
     @staticmethod
+    async def get_due_reminders(now: datetime = None) -> List[Dict]:
+        """การเตือนที่ถึงเวลาแล้วและยังไม่ถูกส่ง
+
+        remind_at เก็บเป็น datetime.now().isoformat() คือเวลาท้องถิ่นแบบไม่มี
+        timezone การเทียบจึงต้องใช้ datetime.now() เหมือนกัน ไม่ใช่ utcnow()
+
+        รวมรายการที่เลยกำหนดไปแล้วด้วย ไม่ใช่เฉพาะที่ถึงพอดีในรอบนี้ — ถ้าบอท
+        ดับไปสองชั่วโมง ของที่ครบกำหนดระหว่างนั้นต้องได้ออกตอนกลับมา สายดีกว่าหาย
+        """
+        cutoff = (now or datetime.now()).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, text, remind_at
+            FROM reminders WHERE status = 'pending' AND remind_at <= ?
+            ORDER BY remind_at ASC
+        """, (cutoff,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{"id": r[0], "user_id": r[1], "text": r[2], "remind_at": r[3]} for r in rows]
+
+    @staticmethod
+    async def mark_reminder(reminder_id: int, status: str) -> None:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("UPDATE reminders SET status = ? WHERE id = ?", (status, reminder_id))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
     async def add_note(user_id: int, content: str, tags: str = None) -> int:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1105,6 +1134,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# REMINDER DELIVERY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ถี่แค่ไหนถึงจะไปดูว่ามีอะไรครบกำหนด — /remind รับหน่วยเล็กสุดเป็นนาที
+REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30"))
+
+_reminder_scheduler: Optional[AsyncIOScheduler] = None
+
+
+async def deliver_due_reminders(telegram_bot) -> int:
+    """ส่งการเตือนที่ถึงเวลาแล้ว คืนจำนวนที่ส่งสำเร็จ
+
+    ส่งเป็นข้อความธรรมดา ไม่ใช้ parse_mode โดยตั้งใจ — เนื้อความมาจากผู้ใช้
+    ถ้าใช้ Markdown แล้วมี * _ ` [ ที่ไม่จับคู่ Telegram จะตอบ 400 แล้วการเตือน
+    นั้นก็หายไปเลย ซึ่งแย่กว่าการที่ตัวหนาไม่ขึ้นมาก
+
+    ทำเครื่องหมายว่าส่งแล้ว "หลัง" ส่งสำเร็จเท่านั้น ถ้าโปรเซสตายคาระหว่างนั้น
+    ผู้ใช้จะได้ซ้ำหนึ่งครั้งตอนบูตใหม่ — ยอมให้ซ้ำ ดีกว่ายอมให้หาย
+    """
+    from telegram.error import Forbidden, TelegramError
+
+    delivered = 0
+    for reminder in await Storage.get_due_reminders():
+        try:
+            await telegram_bot.send_message(
+                chat_id=reminder["user_id"],
+                text=f"⏰ เตือนความจำ\n\n{reminder['text']}",
+            )
+        except Forbidden:
+            # ผู้ใช้บล็อกบอทหรือลบแชททิ้ง ลองใหม่กี่รอบก็ไม่มีทางผ่าน
+            logger.warning("ส่งการเตือน %s ไม่ได้ ผู้ใช้บล็อกบอท", reminder["id"])
+            await Storage.mark_reminder(reminder["id"], "failed")
+        except TelegramError as exc:
+            # ขัดข้องชั่วคราว — ปล่อยไว้เป็น pending ให้รอบหน้าลองใหม่
+            logger.error("ส่งการเตือน %s ไม่สำเร็จ: %s", reminder["id"], exc)
+        else:
+            await Storage.mark_reminder(reminder["id"], "sent")
+            delivered += 1
+    return delivered
+
+
+def start_reminder_scheduler(application: Application) -> AsyncIOScheduler:
+    """เริ่มตัวเดินเวลาที่คอยส่งการเตือน
+
+    ต้องเรียกให้ชัดเจนจากคนที่บูตบอท ไม่ใช่ผ่าน post_init ของ PTB เพราะ app.py
+    ใช้ initialize() + start_polling() ซึ่ง "ไม่" เรียก post_init (มีแต่
+    run_polling/run_webhook ที่เรียก) วางไว้ตรงนั้นแล้วมันจะเงียบไปเฉย ๆ
+
+    coalesce กับ max_instances=1 กันไม่ให้รอบที่ค้างสะสมแล้วยิงรัวพร้อมกัน
+    """
+    global _reminder_scheduler
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        deliver_due_reminders,
+        "interval",
+        seconds=REMINDER_POLL_SECONDS,
+        args=[application.bot],
+        coalesce=True,
+        max_instances=1,
+        id="deliver_due_reminders",
+    )
+    scheduler.start()
+    _reminder_scheduler = scheduler
+    logger.info("ตัวส่งการเตือนเริ่มแล้ว ตรวจทุก %d วินาที", REMINDER_POLL_SECONDS)
+    return scheduler
+
+
+def stop_reminder_scheduler() -> None:
+    global _reminder_scheduler
+
+    if _reminder_scheduler is None:
+        return
+    _reminder_scheduler.remove_all_jobs()
+    _reminder_scheduler.shutdown(wait=False)
+    _reminder_scheduler = None
+    logger.info("ตัวส่งการเตือนหยุดแล้ว")
+
+
 def build_application() -> Application:
     """Build the Telegram application with every handler registered.
 
@@ -1142,11 +1251,22 @@ def build_application() -> Application:
     return app
 
 
+async def _post_init(application: Application) -> None:
+    start_reminder_scheduler(application)
+
+
+async def _post_shutdown(application: Application) -> None:
+    stop_reminder_scheduler()
+
+
 def main():
     """Start the bot on its own (app.py runs it together with the webhook)"""
     init_db()
     app = build_application()
-    
+    # run_polling เรียก post_init/post_shutdown ให้ ต่างจากเส้นทางของ app.py
+    app.post_init = _post_init
+    app.post_shutdown = _post_shutdown
+
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
