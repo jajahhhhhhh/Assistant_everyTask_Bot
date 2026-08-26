@@ -67,7 +67,71 @@ async def start_telegram():
     return application
 
 
+def describe_storage() -> None:
+    """บอกตอนบูตว่าข้อมูลจะไปอยู่ที่ไหนจริง ๆ
+
+    กับดักที่เคยกินเวลาไปทั้งเช้า: DATABASE_PATH ที่เป็น path แบบสัมพัทธ์กลบ
+    DATA_DIR ได้ทั้งใบ
+
+        DATA_DIR = os.getenv("DATA_DIR", "data")
+        DB_PATH  = os.getenv("DATABASE_PATH", f"{DATA_DIR}/assistant.db")
+
+    ตั้ง DATA_DIR=/data ไว้แล้ว แต่ถ้ามี DATABASE_PATH=data/assistant.db ค้างอยู่
+    ไฟล์จริงจะกลายเป็น /app/data/assistant.db คือดิสก์ในคอนเทนเนอร์ที่หายทุก
+    deploy ส่วน volume ที่ mount ไว้ก็นอนว่างอยู่อย่างนั้น ไม่มีอะไรผิดพลาดให้
+    เห็นสักอย่าง บอทตอบได้ปกติ ข้อมูลเข้าปกติ แล้วหายเงียบ ๆ ตอน deploy ถัดไป
+
+    ทั้งสามอย่างที่ตรวจตรงนี้จึงเป็น "เงียบแล้วเจ็บทีหลัง" เหมือนกันหมด
+    """
+    import bot   # start_telegram() import อยู่แล้ว ตรงนี้จึงไม่เพิ่มผลข้างเคียง
+
+    resolved = os.path.abspath(line_webhook.DB_PATH)
+    logger.info("ฐานข้อมูล: %s", resolved)
+
+    # 1. สองฝั่งต้องเขียนไฟล์เดียวกัน ไม่งั้นข้อมูลแตกเป็นสองชุดแบบไม่มีใครรู้
+    if os.path.abspath(bot.DB_PATH) != resolved:
+        logger.error(
+            "Telegram กับ webhook ชี้คนละไฟล์ (%s กับ %s) — ข้อมูลจะแยกกันสองชุด",
+            os.path.abspath(bot.DB_PATH),
+            resolved,
+        )
+
+    # 2. path สัมพัทธ์แปลว่า DATA_DIR ถูกกลบไปแล้ว
+    configured = os.getenv("DATABASE_PATH")
+    if configured and not os.path.isabs(configured):
+        logger.warning(
+            "DATABASE_PATH=%r เป็น path แบบสัมพัทธ์ จึงกลายเป็น %s และทับ DATA_DIR=%r "
+            "ที่ตั้งไว้ — ตั้งเป็น absolute path หรือลบทิ้งแล้วใช้ DATA_DIR แทน",
+            configured,
+            resolved,
+            os.getenv("DATA_DIR"),
+        )
+
+    # 3. volume ของ Railway เป็นอุปกรณ์คนละตัวกับ root filesystem
+    directory = os.path.dirname(resolved) or "/"
+    # โฟลเดอร์ข้อมูลถูกสร้างใน start_web() ซึ่งยังไม่ได้รันตอนนี้ จึงต้องดูโฟลเดอร์
+    # แม่ที่ใกล้ที่สุดที่มีอยู่จริง — volume ที่ mount ไว้ก็ตอบถูกอยู่ดี เพราะจุด
+    # mount เองมีอยู่แล้วก่อนแอปเริ่ม
+    probe = directory
+    while not os.path.exists(probe) and os.path.dirname(probe) != probe:
+        probe = os.path.dirname(probe)
+    try:
+        persistent = os.stat(probe).st_dev != os.stat("/").st_dev
+    except OSError as exc:
+        logger.warning("ตรวจไม่ได้ว่า %s อยู่บน volume หรือไม่: %s", directory, exc)
+        return
+    if persistent:
+        logger.info("%s อยู่บน volume — ข้อมูลอยู่ข้าม deploy ได้", directory)
+    else:
+        logger.warning(
+            "%s ไม่ได้อยู่บน volume — ข้อมูลทั้งหมดจะหายเมื่อ deploy ครั้งถัดไป",
+            directory,
+        )
+
+
 async def run() -> None:
+    describe_storage()
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
