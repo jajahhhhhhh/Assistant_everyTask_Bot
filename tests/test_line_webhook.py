@@ -6,6 +6,7 @@
 ต่อ เพื่อยืนยันว่า view ที่รายงานจริงใช้ อ่านสิ่งที่ handler เขียนได้
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -396,6 +397,69 @@ class TestWaitLifecycle(WebhookCase):
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0]["unblocked_at"], "2026-08-20T10:00:00Z")
         self.assert_no_pointer_drift()
+
+
+class TestConcurrentEvents(WebhookCase):
+    """หลาย event ในชุดเดียวต้องประมวลผลครบทุกตัว
+
+    _process เคยเปิด connection เดียวแล้วส่งข้าม asyncio.to_thread หลายครั้ง
+    (apply_classification, _release, _run_owner_command, _run_reno,
+    finish_delivery) พอ event เข้ามาพร้อมกัน thread pool แตกเป็นหลายเธรด
+    sqlite จึงโยน ProgrammingError กลางทาง ผลคือข้อความถูกบันทึกใน
+    chat_messages แต่จังหวะ 4-7 ตายเงียบ ๆ — ไม่ปลดการรอ ไม่ทำคำสั่ง
+    ไม่ตอบกลับ และแถว delivery ค้างที่ received
+    """
+
+    async def test_every_event_in_a_batch_is_processed(self):
+        events = [
+            message_event(event_id=f"conc{i}", user_id=FARID, text=f"ข้อความที่ {i}")
+            for i in range(8)
+        ]
+        await self.post(events)
+
+        self.assertEqual(len(self.query("SELECT id FROM chat_messages")), 8)
+
+        statuses = self.query(
+            "SELECT status, COUNT(*) AS n FROM line_webhook_deliveries GROUP BY status"
+        )
+        self.assertEqual(
+            {row["status"]: row["n"] for row in statuses},
+            {"processed": 8},
+            "จังหวะ 4-7 ต้องจบครบทุก event ไม่ค้างที่ received และไม่ failed",
+        )
+
+    async def test_waits_still_close_when_events_arrive_together(self):
+        """การปลดการรอต้องไม่หายไปเพราะ event เข้ามาพร้อมกัน"""
+        self.open_wait()
+        events = [
+            message_event(event_id=f"batch{i}", user_id=FARID, text=f"ครับ {i}")
+            for i in range(6)
+        ]
+        await self.post(events)
+
+        blocks = self.query("SELECT * FROM task_blocks")
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNotNone(blocks[0]["unblocked_at"], "การรอต้องถูกปลด")
+        self.assert_no_pointer_drift()
+
+    async def test_owner_replies_survive_arriving_together(self):
+        """record_owner_reply ก็ถือ connection ข้ามเธรดแบบเดียวกัน
+
+        เปิดที่เธรดหนึ่ง เขียนที่อีกเธรด ปิดที่เธรดที่สาม พอเรียกพร้อมกันจาก
+        แดชบอร์ด thread pool แตกเป็นหลายเธรด การตอบของเจ้าของจึงหายเงียบ ๆ
+        """
+        await self.post([message_event(event_id="q9", user_id=FARID, text="ราคาเท่าไหร่")])
+        thread_id = self.query("SELECT id FROM chat_threads")[0]["id"]
+
+        await asyncio.gather(
+            *(
+                self.handler.record_owner_reply(thread_id=thread_id, body=f"ตอบที่ {i}")
+                for i in range(8)
+            )
+        )
+
+        outbound = self.query("SELECT id FROM chat_messages WHERE direction='out'")
+        self.assertEqual(len(outbound), 8, "การตอบของเจ้าของต้องถูกบันทึกครบทุกครั้ง")
 
 
 class TestOwnerCommands(WebhookCase):
