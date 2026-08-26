@@ -1115,11 +1115,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_setup_state:
         state = user_setup_state[user_id]
         
-        if text.lower() == "/cancel":
-            user_setup_state.pop(user_id, None)
-            await update.message.reply_text("Setup cancelled ❌")
-            return
-        
         # Airtable setup
         if state["type"] == "airtable":
             if state["step"] == 1:

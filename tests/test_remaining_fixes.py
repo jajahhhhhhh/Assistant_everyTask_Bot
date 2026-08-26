@@ -147,11 +147,40 @@ class TestCancel(BotDbCase):
         self.assertIn("ไม่มีอะไรให้ยกเลิก", await self.cancel())
 
     def test_the_command_is_registered(self):
-        """เดิมไม่มี handler เลย พิมพ์ /cancel แล้วเงียบ"""
+        """เดิมไม่มี handler เลย พิมพ์ /cancel แล้วเงียบ
+
+        สร้าง Application จริงแล้วดูว่ามี handler อยู่ ไม่ใช่ค้นข้อความในซอร์ส —
+        การค้นข้อความจะแดงเวลาจัดรูปแบบโค้ดใหม่ ทั้งที่ไม่มีอะไรเสีย และจะเขียว
+        ถ้ามีคนเขียนสตริงนั้นไว้ในคอมเมนต์
+        """
+        from telegram.ext import CommandHandler
+
+        original = bot.BOT_TOKEN
+        bot.BOT_TOKEN = "123456:AAFakeTokenForTestingOnly"
+        try:
+            application = bot.build_application()
+        finally:
+            bot.BOT_TOKEN = original
+
+        commands = {
+            command
+            for group in application.handlers.values()
+            for handler in group
+            if isinstance(handler, CommandHandler)
+            for command in handler.commands
+        }
+        self.assertIn("cancel", commands)
+
+    def test_plain_text_never_reaches_a_cancel_branch(self):
+        """handle_message ลงทะเบียนด้วย ~filters.COMMAND
+
+        เดิมมีบล็อกเช็ค text == "/cancel" อยู่ข้างใน handle_message ซึ่งไปไม่ถึง
+        ตลอดกาล เพราะ filter กรองคำสั่งออกไปก่อน — /cancel จึงไม่เคยทำงานเลย
+        ทั้งที่โค้ดดูเหมือนรองรับอยู่ ลบทิ้งแล้วเหลือทางเดียวคือ cancel_command
+        """
         import inspect
 
-        source = inspect.getsource(bot.build_application)
-        self.assertIn('CommandHandler("cancel", cancel_command)', source)
+        self.assertNotIn("/cancel", inspect.getsource(bot.handle_message))
 
 
 if __name__ == "__main__":
