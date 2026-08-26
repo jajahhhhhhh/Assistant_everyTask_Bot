@@ -6,6 +6,7 @@
 ต่อ เพื่อยืนยันว่า view ที่รายงานจริงใช้ อ่านสิ่งที่ handler เขียนได้
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -440,6 +441,25 @@ class TestConcurrentEvents(WebhookCase):
         self.assertEqual(len(blocks), 1)
         self.assertIsNotNone(blocks[0]["unblocked_at"], "การรอต้องถูกปลด")
         self.assert_no_pointer_drift()
+
+    async def test_owner_replies_survive_arriving_together(self):
+        """record_owner_reply ก็ถือ connection ข้ามเธรดแบบเดียวกัน
+
+        เปิดที่เธรดหนึ่ง เขียนที่อีกเธรด ปิดที่เธรดที่สาม พอเรียกพร้อมกันจาก
+        แดชบอร์ด thread pool แตกเป็นหลายเธรด การตอบของเจ้าของจึงหายเงียบ ๆ
+        """
+        await self.post([message_event(event_id="q9", user_id=FARID, text="ราคาเท่าไหร่")])
+        thread_id = self.query("SELECT id FROM chat_threads")[0]["id"]
+
+        await asyncio.gather(
+            *(
+                self.handler.record_owner_reply(thread_id=thread_id, body=f"ตอบที่ {i}")
+                for i in range(8)
+            )
+        )
+
+        outbound = self.query("SELECT id FROM chat_messages WHERE direction='out'")
+        self.assertEqual(len(outbound), 8, "การตอบของเจ้าของต้องถูกบันทึกครบทุกครั้ง")
 
 
 class TestOwnerCommands(WebhookCase):

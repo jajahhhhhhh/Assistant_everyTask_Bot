@@ -1199,19 +1199,16 @@ class LineWebhookHandler:
 
         นี่คือทางเดียวที่ responded_at ควรถูกเติม — การตอบของคน ไม่ใช่ของบอท
         """
-        conn = await asyncio.to_thread(connect, self.db_path)
-        try:
-            return await asyncio.to_thread(
-                insert_outbound_message,
-                conn,
-                thread_id=thread_id,
-                body=body,
-                sent_at=utc_now(),
-                project_id=project_id,
-                mark_responded=True,
-            )
-        finally:
-            await asyncio.to_thread(conn.close)
+        return await asyncio.to_thread(
+            _with_connection,
+            self.db_path,
+            insert_outbound_message,
+            thread_id=thread_id,
+            body=body,
+            sent_at=utc_now(),
+            project_id=project_id,
+            mark_responded=True,
+        )
 
     # ── งานเบื้องหลัง ────────────────────────────────────────────────────────
     def _spawn(self, coro) -> asyncio.Task:
