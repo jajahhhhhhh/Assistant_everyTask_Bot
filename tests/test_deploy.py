@@ -173,7 +173,10 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         responses = await asyncio.gather(
             *[self.client.get("/healthz") for _ in range(12)]
         )
+        # อ่าน body ให้ครบก่อน — ปล่อย connection คืน pool ไม่ให้ค้าง
+        payloads = [await response.json() for response in responses]
         self.assertEqual([r.status for r in responses], [200] * 12)
+        self.assertEqual([p["status"] for p in payloads], ["ok"] * 12)
 
     async def test_invariants_survives_concurrent_probes(self):
         """_invariants เคยมีบั๊กข้ามเธรดแบบเดียวกัน"""
@@ -182,7 +185,9 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         responses = await asyncio.gather(
             *[self.client.get("/healthz/invariants") for _ in range(12)]
         )
+        payloads = [await response.json() for response in responses]
         self.assertEqual([r.status for r in responses], [200] * 12)
+        self.assertEqual([p["status"] for p in payloads], ["ok"] * 12)
 
 
 if __name__ == "__main__":
