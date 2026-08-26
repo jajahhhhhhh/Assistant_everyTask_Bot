@@ -2,9 +2,11 @@
 เทสต์ของที่เหลือจาก PR #5 และบั๊กที่เจอระหว่างตรวจ
 
   1. detect_priority  — เดิมจับแบบ substring "highlight" จึงกลายเป็น high
-  2. /mystorage       — โยน TypeError เมื่อคอลัมน์ในฐานข้อมูลเป็น NULL
-  3. handle_voice     — ไฟล์ .ogg ค้างทุกครั้งที่ถอดเสียงล้มเหลว
-  4. /cancel          — ไม่มีทางออกจากโหมดตั้งค่า
+  2. handle_voice     — ไฟล์ .ogg ค้างทุกครั้งที่ถอดเสียงล้มเหลว
+  3. /cancel          — ไม่มีทางออกจากโหมดตั้งค่า
+
+(/mystorage ที่โยน TypeError เมื่อคอลัมน์เป็น NULL ย้ายไปแก้ใน #17 เพราะ PR นั้น
+แตะบรรทัดเดียวกันและรีวิวชี้ที่นั่น)
 """
 
 import os
@@ -84,31 +86,6 @@ class TestPriorityReachesStorage(BotDbCase):
         update = FakeUpdate()
         await bot.task_command(update, SimpleNamespace(args=["urgent", "fix"]))
         self.assertEqual((await bot.Storage.get_tasks(USER_A))[0]["priority"], "urgent")
-
-
-class TestMyStorageSurvivesNulls(BotDbCase):
-    """คอลัมน์ในฐานข้อมูลเป็น NULL ได้ ค่าเริ่มต้นของ .get() ช่วยไม่ได้"""
-
-    async def show(self):
-        update = FakeUpdate()
-        await bot.mystorage_command(update, SimpleNamespace(args=[]))
-        return update.message.replies[-1]
-
-    async def test_sheets_without_an_id_does_not_crash(self):
-        bot.StorageSettings.set_storage_type(USER_A, "sheets")
-        self.assertIn("ยังไม่ได้ตั้ง", await self.show())
-
-    async def test_airtable_without_a_base_does_not_crash(self):
-        bot.StorageSettings.set_storage_type(USER_A, "airtable")
-        self.assertIn("ยังไม่ได้ตั้ง", await self.show())
-
-    async def test_a_configured_sheet_is_shown_truncated(self):
-        bot.StorageSettings.set_google_sheets(USER_A, "1" * 40)
-        shown = await self.show()
-        self.assertIn("1" * 20 + "...", shown)
-
-    async def test_local_storage_needs_no_extra_line(self):
-        self.assertIn("Local", await self.show())
 
 
 class TestVoiceTempFile(BotDbCase):

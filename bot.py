@@ -1039,7 +1039,7 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ค่าเริ่มต้นของ .get() ใช้ได้แค่ตอน "ไม่มีคีย์" แต่คอลัมน์ในฐานข้อมูลเป็น NULL
     # ได้ ซึ่งคืน None มา แล้ว None[:20] โยน TypeError — เกิดจริงเมื่อผู้ใช้เลือก
-    # sheets แล้วยังไม่ได้ใส่ id
+    # sheets แล้วยังไม่ได้ใส่ id ส่วน escape_code(None) ก็คืนช่องว่างเปล่า ๆ
     if storage_type == "airtable":
         base_id = settings.get("airtable_base_id") or "ยังไม่ได้ตั้ง"
         text += f"Base: `{escape_code(base_id)}`"
