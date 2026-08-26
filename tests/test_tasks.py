@@ -187,6 +187,28 @@ class TestSharedTaskTable(unittest.IsolatedAsyncioTestCase):
             [t["title"] for t in await bot.Storage.get_tasks(111)], ["งานจาก Telegram"]
         )
 
+    async def test_the_bot_writes_with_foreign_keys_enforced(self):
+        """ตารางกลางพึ่ง FK และ ON DELETE CASCADE — สองเส้นทางต้องตั้งค่าเหมือนกัน
+
+        sqlite3.connect() เปล่า ๆ ปิด foreign_keys ไว้เป็นค่าเริ่มต้น และ PRAGMA
+        ที่อยู่หัว 01_schema.sql มีผลแค่กับ connection ที่รันสคริปต์นั้น ไม่ติดไป
+        กับไฟล์ ถ้าฝั่งบอทเขียนโดยไม่เปิด FK แถวกำพร้าใน task_events จะเข้าได้
+        เงียบ ๆ ทั้งที่ฝั่งเว็บเขียนแบบเดียวกันไม่ได้
+        """
+        bot.init_db()
+
+        conn = bot.connect(bot.DB_PATH)
+        try:
+            self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            with self.assertRaises(sqlite3.IntegrityError):
+                with conn:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, to_status, at) VALUES (?, 'inbox', ?)",
+                        (99999, line_webhook.utc_now()),
+                    )
+        finally:
+            conn.close()
+
     async def test_priority_is_added_to_a_database_that_predates_it(self):
         """ฐานข้อมูลบน volume ที่สร้างไว้ก่อนมีคอลัมน์นี้ ต้องถูกเติมให้ ไม่ใช่พัง
 

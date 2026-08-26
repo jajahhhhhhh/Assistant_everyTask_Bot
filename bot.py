@@ -22,6 +22,8 @@ from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiohttp
 
+import line_webhook
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -32,6 +34,12 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 # ต้องเป็นไฟล์เดียวกับที่ line_webhook.py ใช้ ไม่งั้นสองส่วนเขียนคนละฐาน
 DB_PATH = os.getenv("DATABASE_PATH", f"{DATA_DIR}/assistant.db")
 
+# ใช้ connection ตัวเดียวกับฝั่งเว็บ — ทั้งสองเส้นทางเขียนไฟล์เดียวกัน ถ้าตั้งค่า
+# ไม่ตรงกันจะได้พฤติกรรมคนละอย่างบนตารางเดียวกัน sqlite3.connect เปล่า ๆ ปิด
+# foreign_keys ไว้ (ตารางกลางพึ่ง FK และ ON DELETE CASCADE) และไม่มี busy timeout
+# ให้รอเมื่ออีกฝั่งกำลังเขียนอยู่
+connect = line_webhook.connect
+
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -40,7 +48,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-import line_webhook
 
 logger = logging.getLogger(__name__)
 # Silence httpx/httpcore request logs so the bot token never lands in logs
@@ -90,7 +97,7 @@ def init_db():
     """
     line_webhook.init_webhook_tables(DB_PATH)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect(DB_PATH)
     cursor = conn.cursor()
 
     _add_missing_columns(cursor)
@@ -355,7 +362,7 @@ class Storage:
         source_ref คือสิ่งที่บอกว่างานเป็นของใคร แทนคอลัมน์ user_id เดิม รูปแบบ
         เดียวกับที่ฝั่ง LINE ใช้ (source='line', source_ref = chat_messages.id)
         """
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect(DB_PATH)
         try:
             at = line_webhook.utc_now()
             with conn:
@@ -380,7 +387,7 @@ class Storage:
     @staticmethod
     async def get_tasks(user_id: int, status: str = None) -> List[Dict]:
         """งานของผู้ใช้คนนี้เท่านั้น — งานที่มาจาก LINE จะไม่ติดมาด้วย"""
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect(DB_PATH)
         try:
             sql = """
                 SELECT t.id, t.title, t.priority, t.status, t.due_at, p.name
@@ -409,7 +416,7 @@ class Storage:
     
     @staticmethod
     async def complete_task(user_id: int, task_id: int) -> bool:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect(DB_PATH)
         try:
             at = line_webhook.utc_now()
             with conn:
