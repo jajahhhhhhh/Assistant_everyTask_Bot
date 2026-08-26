@@ -61,6 +61,35 @@ LANGUAGES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TASK PRIORITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# คำอังกฤษจับที่ขอบคำ ไม่งั้น "highlight" กลายเป็น high, "flowchart" กับ "pillow"
+# กลายเป็น low ส่วนภาษาไทยเขียนติดกันไม่มีช่องว่าง จึงยังต้องจับแบบ substring
+_PRIORITY_RULES = (
+    ("urgent", (r"\burgent\b", r"\basap\b"), ("ด่วน",)),
+    ("high", (r"\bimportant\b", r"\bhigh\b"), ("สำคัญ",)),
+    ("low", (r"\blow\b", r"\blater\b"), ("ต่ำ",)),
+)
+
+
+def detect_priority(title: Any) -> str:
+    """เดาความสำคัญจากชื่องาน ค่าเริ่มต้นคือ medium"""
+    lowered = str(title or "").lower()
+
+    if "!" in lowered:
+        return "urgent"
+
+    for priority, patterns, substrings in _PRIORITY_RULES:
+        if any(re.search(pattern, lowered) for pattern in patterns):
+            return priority
+        if any(word in lowered for word in substrings):
+            return priority
+
+    return "medium"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MARKDOWN ESCAPING
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -660,15 +689,7 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     title = " ".join(context.args)
     
-    # Detect priority
-    priority = "medium"
-    title_lower = title.lower()
-    if any(w in title_lower for w in ["urgent", "ด่วน", "asap", "!"]):
-        priority = "urgent"
-    elif any(w in title_lower for w in ["important", "สำคัญ", "high"]):
-        priority = "high"
-    elif any(w in title_lower for w in ["low", "ต่ำ", "later"]):
-        priority = "low"
+    priority = detect_priority(title)
     
     task_id = await Storage.add_task(user_id, title, priority)
     
@@ -892,6 +913,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🎤 Transcribing your voice message...")
     
+    temp_path = None
     try:
         # Download the voice file
         file: File = await context.bot.get_file(voice.file_id)
@@ -903,9 +925,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Transcribe
         transcription = await transcribe_voice(temp_path)
-        
-        # Clean up
-        os.unlink(temp_path)
         
         # Save to database
         conn = sqlite3.connect(DB_PATH)
@@ -927,6 +946,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice handling error: {e}")
         await update.message.reply_text(f"❌ Could not transcribe: {str(e)}")
+    finally:
+        # เดิมลบไฟล์หลังถอดเสียงเสร็จ ถ้าถอดเสียงพังไฟล์ .ogg จะค้างทุกครั้ง
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1011,10 +1037,15 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
+    # ค่าเริ่มต้นของ .get() ใช้ได้แค่ตอน "ไม่มีคีย์" แต่คอลัมน์ในฐานข้อมูลเป็น NULL
+    # ได้ ซึ่งคืน None มา แล้ว None[:20] โยน TypeError — เกิดจริงเมื่อผู้ใช้เลือก
+    # sheets แล้วยังไม่ได้ใส่ id
     if storage_type == "airtable":
-        text += f"Base: `{escape_code(settings.get('airtable_base_id', 'N/A'))}`"
+        base_id = settings.get("airtable_base_id") or "ยังไม่ได้ตั้ง"
+        text += f"Base: `{escape_code(base_id)}`"
     elif storage_type == "sheets":
-        text += f"Sheet: `{escape_code(settings.get('google_sheet_id', 'N/A')[:20])}...`"
+        sheet_id = settings.get("google_sheet_id")
+        text += f"Sheet: `{escape_code(sheet_id[:20] + '...' if sheet_id else 'ยังไม่ได้ตั้ง')}`"
     
     text += "\n\n💡 Use /settings to change"
     
@@ -1059,6 +1090,21 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 # MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ยกเลิกการตั้งค่า storage ที่ค้างอยู่
+
+    ระหว่างตั้งค่า Airtable/Sheets ข้อความธรรมดาทุกข้อความจะถูกกลืนไปเป็นคำตอบ
+    ของขั้นตอนนั้น เดิมไม่มีทางออกเลยนอกจากตั้งค่าให้จบหรือรอรีสตาร์ต
+    """
+    user_id = update.effective_user.id
+
+    if user_setup_state.pop(user_id, None) is None:
+        await update.message.reply_text("ไม่มีอะไรให้ยกเลิก 👍")
+        return
+
+    await update.message.reply_text("ยกเลิกการตั้งค่าแล้ว ❌")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages"""
@@ -1165,6 +1211,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
     app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     
     # Callback handlers
     app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))
