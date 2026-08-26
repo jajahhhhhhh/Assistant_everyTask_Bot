@@ -8,6 +8,7 @@
 """
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -123,9 +124,16 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         self.client = TestClient(TestServer(lw.create_app(self.handler)))
         await self.client.start_server()
 
+        self._original_token = lw.STORAGE_REPORT_TOKEN
+        lw.STORAGE_REPORT_TOKEN = "test-token"
+
     async def asyncTearDown(self):
+        lw.STORAGE_REPORT_TOKEN = self._original_token
         await self.client.close()
         self._tmp.cleanup()
+
+    async def storage(self):
+        return await self.client.get("/healthz/storage", params={"token": "test-token"})
 
     def introduce_drift(self):
         """งานที่ status='blocked' แต่ไม่มี task_blocks ที่เปิดอยู่ (ผิดกฎ E3)"""
@@ -159,6 +167,102 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
     async def test_invariant_endpoint_is_green_when_consistent(self):
         response = await self.client.get("/healthz/invariants")
         self.assertEqual(response.status, 200)
+
+    async def test_storage_reports_where_the_database_lives(self):
+        """ไม่มีทางเข้า shell ของคอนเทนเนอร์ ต้องถามจากในแอปว่า volume ติดไหม"""
+        response = await self.storage()
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+
+        self.assertEqual(body["db_path"], str(Path(self.db_path).resolve()))
+        self.assertTrue(body["exists"])
+        self.assertGreater(body["size_bytes"], 0)
+        # ตัวชี้ขาดว่า volume mount ติดหรือยัง
+        self.assertIn("on_separate_device", body)
+        self.assertIn("predates_this_process", body)
+
+    async def test_storage_counts_what_is_actually_stored(self):
+        """ตัวเลขต้องขยับตามข้อมูลจริง ไม่งั้นดูไม่ออกว่าข้อมูลรอด deploy ไหม"""
+        before = (await (await self.storage()).json())["rows"]
+        self.assertEqual(before["tasks"], 0)
+
+        self.introduce_drift()   # เขียนงานหนึ่งแถวลงฐานข้อมูลจริง
+
+        after = (await (await self.storage()).json())["rows"]
+        self.assertEqual(after["tasks"], 1)
+
+    async def test_storage_is_invisible_without_the_token(self):
+        """บริการเปิดสู่อินเทอร์เน็ตอยู่แล้ว รายงานนี้จึงต้องมีโทเคน"""
+        for request in (
+            self.client.get("/healthz/storage"),
+            self.client.get("/healthz/storage", params={"token": "wrong"}),
+            self.client.get("/healthz/storage", headers={"X-Storage-Token": "wrong"}),
+        ):
+            response = await request
+            self.assertEqual(response.status, 404)
+            # 404 ไม่ใช่ 403 — ไม่บอกคนสแกนว่ามีอะไรซ่อนอยู่ตรงนี้
+            self.assertNotIn("db_path", await response.json())
+
+    async def test_storage_accepts_the_token_in_a_header_too(self):
+        response = await self.client.get(
+            "/healthz/storage", headers={"X-Storage-Token": "test-token"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn("on_separate_device", await response.json())
+
+    async def test_storage_stays_shut_when_no_token_is_configured(self):
+        """ไม่ตั้งค่า = ไม่มี endpoint นี้ ไม่ใช่เปิดให้ทุกคน"""
+        lw.STORAGE_REPORT_TOKEN = ""
+        self.assertEqual((await self.storage()).status, 404)
+
+    async def test_the_ordinary_health_checks_need_no_token(self):
+        """Railway ผูก healthcheck ไว้กับ /healthz — ต้องไม่ถูกด่านนี้กระทบ"""
+        lw.STORAGE_REPORT_TOKEN = ""
+        self.assertEqual((await self.client.get("/healthz")).status, 200)
+        self.assertEqual((await self.client.get("/healthz/invariants")).status, 200)
+
+    async def test_reading_the_report_does_not_touch_the_database(self):
+        """รายงานต้องไม่เขียนอะไรลงฐานข้อมูล
+
+        connect() ปกติสั่ง PRAGMA journal_mode = WAL ทุกครั้ง ซึ่งเป็นการเขียน
+        รายงานจึงเปิดแบบ mode=ro ไฟล์ -wal/-shm ที่โผล่มาเป็นของที่ SQLite สร้าง
+        เองเวลามีคนอ่านฐานข้อมูลแบบ WAL ไม่ใช่การเปลี่ยนสถานะฐานข้อมูล ตัวไฟล์
+        ฐานข้อมูลจริงจึงต้องไม่ขยับเลย
+        """
+        before = os.stat(self.db_path)
+        (await self.storage()).close()
+        after = os.stat(self.db_path)
+        self.assertEqual((after.st_size, after.st_mtime), (before.st_size, before.st_mtime))
+
+    async def test_the_report_reads_through_a_connection_that_cannot_write(self):
+        counts_conn_is_readonly = False
+        original = sqlite3.connect
+
+        def spy(*args, **kwargs):
+            nonlocal counts_conn_is_readonly
+            if kwargs.get("uri") and "mode=ro" in str(args[0]):
+                counts_conn_is_readonly = True
+            return original(*args, **kwargs)
+
+        sqlite3.connect = spy
+        try:
+            lw._row_counts(self.db_path)
+        finally:
+            sqlite3.connect = original
+        self.assertTrue(counts_conn_is_readonly, "รายงานต้องอ่านผ่าน connection ที่เขียนไม่ได้")
+
+    async def test_storage_survives_a_database_that_has_no_tables_yet(self):
+        """ตารางยังไม่ถูกสร้างต้องได้ null ไม่ใช่ทั้ง endpoint พัง"""
+        empty = str(Path(self._tmp.name) / "empty.db")
+        sqlite3.connect(empty).close()
+        snapshot = lw._storage_snapshot(empty)
+        self.assertTrue(snapshot["exists"])
+        self.assertIsNone(snapshot["rows"]["tasks"])
+
+    async def test_storage_reports_a_missing_database_without_crashing(self):
+        snapshot = lw._storage_snapshot(str(Path(self._tmp.name) / "never-created.db"))
+        self.assertFalse(snapshot["exists"])
+        self.assertEqual(snapshot["rows"], {})
 
     async def test_healthz_survives_concurrent_probes(self):
         """คำขอซ้อนกันต้องไม่ทำให้ 500

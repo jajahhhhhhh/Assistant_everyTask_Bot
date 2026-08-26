@@ -49,11 +49,16 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 logger = logging.getLogger(__name__)
+
+# เวลาที่โปรเซสนี้เริ่ม — /healthz/storage เอาไปเทียบกับเวลาแก้ไขไฟล์ฐานข้อมูล
+# ไฟล์ที่เก่ากว่าโปรเซส แปลว่ารอดข้าม deploy มาได้ คือ volume ทำงานจริง
+PROCESS_STARTED_AT = time.time()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -78,6 +83,11 @@ CLASSIFY_BUDGET_SECONDS = float(os.getenv("LINE_CLASSIFY_BUDGET", "20"))
 # ข้อความตอบรับอัตโนมัติของบอทไม่ใช่ "คุณตอบเขาแล้ว" ถ้าเขียนลง chat_messages
 # ทุกครั้ง v_unanswered_now จะว่างเปล่าตลอดกาล ค่าเริ่มต้นจึงเป็นไม่เขียน
 LOG_BOT_ACKS = os.getenv("LINE_LOG_BOT_ACKS", "0") == "1"
+
+# /healthz/storage เปิดเผยพาธในเครื่องกับจำนวนแถว ซึ่งมากกว่าที่ /healthz บอก
+# บริการนี้ต้องเปิดสู่อินเทอร์เน็ตอยู่แล้วเพราะ LINE ต้องยิง webhook เข้ามาได้
+# ถ้าไม่ตั้งค่านี้ endpoint จะไม่มีอยู่เลย
+STORAGE_REPORT_TOKEN = os.getenv("STORAGE_REPORT_TOKEN", "")
 
 MAX_BODY_BYTES = 512 * 1024
 
@@ -1332,6 +1342,101 @@ async def _invariants(request: web.Request) -> web.Response:
     )
 
 
+def _storage_snapshot(db_path: str) -> Dict[str, Any]:
+    """สำรวจว่าไฟล์ฐานข้อมูลอยู่ที่ไหนและมีอะไรอยู่ — จบในเธรดเดียว"""
+    directory = os.path.dirname(os.path.abspath(db_path)) or "/"
+    report: Dict[str, Any] = {
+        "db_path": os.path.abspath(db_path),
+        "data_dir": directory,
+        "exists": os.path.exists(db_path),
+    }
+
+    # volume ของ Railway ถูก mount เป็นอุปกรณ์คนละตัวกับ root filesystem
+    # ถ้า st_dev ตรงกับของ / แปลว่ายังเขียนลงดิสก์ชั่วคราวที่หายทุก deploy
+    try:
+        report["on_separate_device"] = os.stat(directory).st_dev != os.stat("/").st_dev
+    except OSError as exc:
+        report["on_separate_device"] = None
+        report["device_error"] = str(exc)
+
+    if report["exists"]:
+        # ไฟล์อาจหายไประหว่าง exists() กับ stat() — นี่คือรายงาน ไม่ควรพังทั้ง endpoint
+        try:
+            stat = os.stat(db_path)
+        except OSError as exc:
+            report["exists"] = False
+            report["stat_error"] = str(exc)
+        else:
+            report["size_bytes"] = stat.st_size
+            report["modified_at"] = _iso(stat.st_mtime)
+            # ไฟล์เก่ากว่าโปรเซสนี้ = รอดข้าม deploy มา = volume ทำงานจริง
+            report["predates_this_process"] = stat.st_mtime < PROCESS_STARTED_AT
+
+    report["process_started_at"] = _iso(PROCESS_STARTED_AT)
+    report["rows"] = _row_counts(db_path) if report["exists"] else {}
+    return report
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+COUNTED_TABLES = ("tasks", "chat_messages", "chat_threads", "reminders", "notes")
+
+
+def _row_counts(db_path: str) -> Dict[str, Any]:
+    """นับแถวเท่าที่นับได้ ตารางที่ยังไม่มีก็ข้ามไป ไม่ทำให้ทั้ง endpoint พัง"""
+    counts: Dict[str, Any] = {}
+    try:
+        # อ่านอย่างเดียว — connect() ปกติสั่ง PRAGMA journal_mode = WAL ทุกครั้ง
+        # ซึ่งเป็นการเขียน รายงานไม่ควรไปแตะสถานะของฐานข้อมูล และจะพังถ้า volume
+        # ถูก mount แบบอ่านอย่างเดียว
+        conn = sqlite3.connect(f"file:{quote(os.path.abspath(db_path))}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return {"error": str(exc)}
+    try:
+        for table in COUNTED_TABLES:
+            try:
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.Error:
+                counts[table] = None      # ตารางยังไม่ถูกสร้าง
+    finally:
+        conn.close()
+    return counts
+
+
+def _storage_token_ok(request: web.Request) -> bool:
+    """โทเคนมาทาง header หรือ query ก็ได้ — query ทำให้เปิดจากเบราว์เซอร์ได้เลย"""
+    if not STORAGE_REPORT_TOKEN:
+        return False
+    supplied = request.headers.get("X-Storage-Token") or request.query.get("token", "")
+    return hmac.compare_digest(supplied, STORAGE_REPORT_TOKEN)
+
+
+async def _storage(request: web.Request) -> web.Response:
+    """ฐานข้อมูลอยู่ที่ไหน อยู่บน volume จริงไหม และมีอะไรอยู่ในนั้นบ้าง
+
+    ไม่มีทางเข้า shell ของคอนเทนเนอร์บน Railway การจะรู้ว่า volume mount ติดจริง
+    ไหมจึงต้องถามจากในแอปเอง ตัวชี้ขาดคือ on_separate_device — volume ถูก mount
+    เป็นอุปกรณ์คนละตัวกับ root filesystem ถ้าเป็น false แปลว่ายังเขียนลงดิสก์
+    ชั่วคราวที่หายทุก deploy อยู่
+
+    ต้องมี STORAGE_REPORT_TOKEN ถึงจะเรียกได้ — รายงานนี้บอกพาธในเครื่องและจำนวน
+    แถว ซึ่งมากกว่าที่ /healthz บอก และบริการต้องเปิดสู่อินเทอร์เน็ตอยู่แล้วเพราะ
+    LINE ต้องยิง webhook เข้ามาได้ ไม่ตั้งค่า = ไม่มี endpoint นี้ ตอบ 404 เหมือน
+    พาธที่ไม่มีอยู่จริง ไม่ใช่ 403 ที่ไปบอกคนสแกนว่ามีอะไรซ่อนอยู่ตรงนี้
+
+    ผ่านด่านแล้วตอบ 200 เสมอ นี่คือรายงาน ไม่ใช่ health check — Railway ผูกอยู่
+    กับ /healthz ซึ่งไม่ต้องใช้โทเคน
+    """
+    if not _storage_token_ok(request):
+        return web.json_response({"error": "not found"}, status=404)
+
+    handler: LineWebhookHandler = request.app["line_handler"]
+    snapshot = await asyncio.to_thread(_storage_snapshot, handler.db_path)
+    return web.json_response(snapshot)
+
+
 def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     if handler is None:
         init_webhook_tables(DB_PATH)
@@ -1347,6 +1452,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     app.router.add_post(WEBHOOK_PATH, handler.handle)
     app.router.add_get("/healthz", _health)
     app.router.add_get("/healthz/invariants", _invariants)
+    app.router.add_get("/healthz/storage", _storage)
 
     async def _cleanup(app: web.Application) -> None:
         await app["line_handler"].close()
