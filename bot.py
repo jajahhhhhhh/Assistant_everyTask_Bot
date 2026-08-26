@@ -40,6 +40,15 @@ DB_PATH = os.getenv("DATABASE_PATH", f"{DATA_DIR}/assistant.db")
 # ให้รอเมื่ออีกฝั่งกำลังเขียนอยู่
 connect = line_webhook.connect
 
+# Google Drive ใช้ OAuth ของ "เจ้าของบอท" ไม่ใช่ของผู้ใช้แต่ละคน ผู้ใช้แค่กด
+# ยินยอมผ่านลิงก์ แล้ว refresh token กลับมาที่เซิร์ฟเวอร์เอง — ไม่มี credential
+# ตัวไหนวิ่งผ่านแชต Telegram เลย ซึ่งเป็นเหตุผลเดียวที่ทำแบบนี้แทนวิธีที่ให้
+# ผู้ใช้พิมพ์ token ใส่แชต (แบบนั้น token จะค้างในประวัติแชตถาวร)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+# URL สาธารณะของบริการนี้ ใช้ประกอบ redirect_uri ที่ต้องตรงกับที่ลงทะเบียนไว้
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -149,6 +158,22 @@ def _add_missing_columns(cursor):
     if "priority" not in columns:
         cursor.execute("ALTER TABLE tasks ADD COLUMN priority TEXT")
 
+    # คอลัมน์ของ Google Drive เพิ่มทีหลัง ฐานข้อมูลบน volume ที่สร้างไว้ก่อนหน้า
+    # จะไม่มีให้ ถ้าไม่ ALTER ตรงนี้ get_settings จะพังด้วย "no such column"
+    #
+    # PRAGMA ของตารางที่ยังไม่มีคืนค่าว่าง ไม่ใช่ error — ฐานข้อมูลใหม่เอี่ยมจึง
+    # ตกมาที่ทางนี้ และต้องข้ามไป เพราะ CREATE TABLE ข้างล่างใน init_db() ประกาศ
+    # คอลัมน์ครบอยู่แล้ว ส่วน ALTER TABLE บนตารางที่ยังไม่มีจะพัง
+    settings_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(user_storage_settings)")
+    }
+    if settings_columns:
+        for column in ("google_refresh_token", "google_drive_folder_id"):
+            if column not in settings_columns:
+                cursor.execute(
+                    f"ALTER TABLE user_storage_settings ADD COLUMN {column} TEXT"
+                )
+
 
 def init_db():
     """สร้างตารางทั้งหมดที่บอทใช้
@@ -200,6 +225,8 @@ def init_db():
             airtable_base_id TEXT,
             airtable_table_name TEXT DEFAULT 'Tasks',
             google_sheet_id TEXT,
+            google_refresh_token TEXT,
+            google_drive_folder_id TEXT,
             preferred_language TEXT DEFAULT 'en',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -234,13 +261,14 @@ class StorageSettings:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT storage_type, airtable_api_key, airtable_base_id, 
-                   airtable_table_name, google_sheet_id, preferred_language
+            SELECT storage_type, airtable_api_key, airtable_base_id,
+                   airtable_table_name, google_sheet_id, preferred_language,
+                   google_refresh_token, google_drive_folder_id
             FROM user_storage_settings WHERE user_id = ?
         """, (user_id,))
         row = cursor.fetchone()
         conn.close()
-        
+
         if row:
             return {
                 "storage_type": row[0] or "local",
@@ -248,7 +276,9 @@ class StorageSettings:
                 "airtable_base_id": row[2],
                 "airtable_table_name": row[3] or "Tasks",
                 "google_sheet_id": row[4],
-                "preferred_language": row[5] or "en"
+                "preferred_language": row[5] or "en",
+                "google_refresh_token": row[6],
+                "google_drive_folder_id": row[7],
             }
         return {"storage_type": "local", "preferred_language": "en"}
     
@@ -301,6 +331,42 @@ class StorageSettings:
         conn.close()
     
     @staticmethod
+    def set_google_drive(user_id: int, refresh_token: str, folder_id: Optional[str] = None):
+        """บันทึก refresh token ที่ได้จาก OAuth callback
+
+        เก็บ refresh token ไม่ใช่ access token — access token ของ Google หมดอายุ
+        ในหนึ่งชั่วโมง เก็บไว้ก็ใช้ไม่ได้ในรอบถัดไป ส่วน refresh token อยู่จนกว่า
+        ผู้ใช้จะถอนสิทธิ์เอง
+        """
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings
+                (user_id, storage_type, google_refresh_token, google_drive_folder_id, updated_at)
+            VALUES (?, 'drive', ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                storage_type = 'drive',
+                google_refresh_token = excluded.google_refresh_token,
+                google_drive_folder_id = excluded.google_drive_folder_id,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, refresh_token, folder_id))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def set_drive_folder(user_id: int, folder_id: str):
+        """จำโฟลเดอร์ที่สร้างไว้ครั้งแรก จะได้ไม่สร้างซ้ำทุกครั้งที่เขียน"""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE user_storage_settings
+            SET google_drive_folder_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (folder_id, user_id))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
     def set_language(user_id: int, lang_code: str):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -324,6 +390,8 @@ class StorageSettings:
                 airtable_api_key = NULL,
                 airtable_base_id = NULL,
                 google_sheet_id = NULL,
+                google_refresh_token = NULL,
+                google_drive_folder_id = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE user_id = ?
         """, (user_id,))
@@ -392,6 +460,301 @@ class GoogleSheetsClient:
                         return {"success": False, "message": "❌ Sheet not accessible. Make sure it's shared publicly."}
         except Exception as e:
             return {"success": False, "message": f"❌ Error: {str(e)}"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOOGLE DRIVE INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DRIVE_FOLDER_NAME = "Assistant everyTask Bot"
+DRIVE_MIME_FOLDER = "application/vnd.google-apps.folder"
+
+
+def _drive_data_filename(user_id: int) -> str:
+    return f"assistant_data_{user_id}.json"
+
+
+class GoogleDriveClient:
+    """Google Drive client ที่ต่ออายุ access token ให้เอง
+
+    ต่างจากโมดูลต้นทางตรงที่รับ refresh token ไม่ใช่ access token — access token
+    ของ Google อายุหนึ่งชั่วโมง ถ้าเก็บตัวนั้นไว้ในฐานข้อมูล ผู้ใช้จะต่อได้แค่
+    ชั่วโมงแรกแล้วเงียบไปเฉย ๆ โดยไม่มีอะไรฟ้อง
+    """
+
+    DRIVE_API_URL = "https://www.googleapis.com/drive/v3"
+    UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3"
+    TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+    def __init__(self, refresh_token: str, folder_id: Optional[str] = None,
+                 client_id: Optional[str] = None, client_secret: Optional[str] = None):
+        self.refresh_token = refresh_token
+        self.folder_id = folder_id
+        self.client_id = client_id or GOOGLE_CLIENT_ID
+        self.client_secret = client_secret or GOOGLE_CLIENT_SECRET
+        self._access_token: Optional[str] = None
+        self._expires_at = datetime.min
+
+    async def _token(self) -> Optional[str]:
+        """คืน access token ที่ยังไม่หมดอายุ ขอใหม่เมื่อจำเป็น"""
+        if self._access_token and datetime.utcnow() < self._expires_at:
+            return self._access_token
+
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": self.refresh_token,
+            "grant_type": "refresh_token",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.TOKEN_URL, data=payload) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    logger.warning(
+                        "ขอ access token ของ Google ไม่สำเร็จ (%s): %s",
+                        response.status, body[:200],
+                    )
+                    return None
+                data = await response.json()
+
+        self._access_token = data.get("access_token")
+        # หักออกหนึ่งนาทีกันเส้นตาย — ขอใหม่ก่อนหมดอายุจริงดีกว่าโดนปฏิเสธกลางคัน
+        self._expires_at = datetime.utcnow() + timedelta(
+            seconds=max(int(data.get("expires_in", 3600)) - 60, 0)
+        )
+        return self._access_token
+
+    async def _headers(self) -> Optional[Dict[str, str]]:
+        token = await self._token()
+        if not token:
+            return None
+        return {"Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"}
+
+    async def test_connection(self) -> Dict[str, Any]:
+        """เช็คว่าต่อ Drive ได้จริง และบอกว่าเป็นบัญชีไหน"""
+        if not self.client_id or not self.client_secret:
+            return {"success": False,
+                    "message": "❌ ยังไม่ได้ตั้ง GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET"}
+        try:
+            headers = await self._headers()
+            if not headers:
+                return {"success": False, "message": "❌ Token หมดอายุหรือถูกถอนสิทธิ์"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.DRIVE_API_URL}/about",
+                    headers=headers,
+                    params={"fields": "user"},
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        email = data.get("user", {}).get("emailAddress", "unknown")
+                        return {"success": True, "message": f"✅ ต่อ Drive แล้ว: {email}"}
+                    if response.status == 401:
+                        return {"success": False, "message": "❌ Token ใช้ไม่ได้แล้ว"}
+                    return {"success": False, "message": f"❌ Error: {response.status}"}
+        except Exception as e:
+            return {"success": False, "message": f"❌ Error: {str(e)}"}
+
+    async def ensure_folder(self) -> Optional[str]:
+        """หาโฟลเดอร์ของบอท ถ้ายังไม่มีก็สร้าง แล้วคืน id"""
+        if self.folder_id:
+            return self.folder_id
+
+        headers = await self._headers()
+        if not headers:
+            return None
+
+        query = (
+            f"name = '{DRIVE_FOLDER_NAME}' and mimeType = '{DRIVE_MIME_FOLDER}' "
+            "and trashed = false"
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.DRIVE_API_URL}/files",
+                headers=headers,
+                params={"q": query, "fields": "files(id)"},
+            ) as response:
+                if response.status == 200:
+                    files = (await response.json()).get("files", [])
+                    if files:
+                        self.folder_id = files[0]["id"]
+                        return self.folder_id
+
+            async with session.post(
+                f"{self.DRIVE_API_URL}/files",
+                headers=headers,
+                json={"name": DRIVE_FOLDER_NAME, "mimeType": DRIVE_MIME_FOLDER},
+            ) as response:
+                if response.status in (200, 201):
+                    self.folder_id = (await response.json()).get("id")
+                    return self.folder_id
+                logger.warning("สร้างโฟลเดอร์บน Drive ไม่สำเร็จ (%s)", response.status)
+        return None
+
+    async def find_file(self, name: str) -> Optional[str]:
+        """หาไฟล์ตามชื่อในโฟลเดอร์ของบอท"""
+        headers = await self._headers()
+        if not headers:
+            return None
+        folder = await self.ensure_folder()
+
+        # ชื่อไฟล์ประกอบจาก user id ล้วน ๆ แต่ escape ไว้ก็ไม่เสียหาย เพราะ
+        # single quote ที่หลุดเข้าไปทำให้ query ของ Drive พังทั้งอัน
+        safe = name.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"name = '{safe}' and trashed = false"
+        if folder:
+            query += f" and '{folder}' in parents"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.DRIVE_API_URL}/files",
+                headers=headers,
+                params={"q": query, "fields": "files(id)"},
+            ) as response:
+                if response.status != 200:
+                    return None
+                files = (await response.json()).get("files", [])
+                return files[0]["id"] if files else None
+
+    async def write_json(self, name: str, payload: Dict[str, Any]) -> Optional[str]:
+        """เขียนไฟล์ JSON — สร้างใหม่ถ้ายังไม่มี ทับของเดิมถ้ามีแล้ว"""
+        token = await self._token()
+        if not token:
+            return None
+
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        file_id = await self.find_file(name)
+
+        if file_id:
+            headers = {"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json; charset=UTF-8"}
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(
+                    f"{self.UPLOAD_URL}/files/{file_id}",
+                    headers=headers,
+                    params={"uploadType": "media"},
+                    data=body.encode("utf-8"),
+                ) as response:
+                    if response.status == 200:
+                        return file_id
+                    logger.warning("อัปเดตไฟล์บน Drive ไม่สำเร็จ (%s)", response.status)
+                    return None
+
+        metadata: Dict[str, Any] = {"name": name}
+        folder = await self.ensure_folder()
+        if folder:
+            metadata["parents"] = [folder]
+
+        # multipart/related ประกอบเองด้วย writer ของ aiohttp แทนการต่อสตริง
+        # boundary ด้วยมือ — ข้อความของผู้ใช้ที่บังเอิญมี boundary อยู่ข้างในจะทำให้
+        # เนื้อไฟล์ที่ต่อเองขาดกลาง
+        with aiohttp.MultipartWriter("related") as mpwriter:
+            part = mpwriter.append_json(metadata)
+            part.set_content_disposition("form-data", name="metadata")
+            part = mpwriter.append(
+                body.encode("utf-8"),
+                {"Content-Type": "application/json; charset=UTF-8"},
+            )
+            part.set_content_disposition("form-data", name="file")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.UPLOAD_URL}/files",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"uploadType": "multipart"},
+                    data=mpwriter,
+                ) as response:
+                    if response.status in (200, 201):
+                        return (await response.json()).get("id")
+                    logger.warning("อัปโหลดไฟล์ขึ้น Drive ไม่สำเร็จ (%s)", response.status)
+                    return None
+
+    async def read_json(self, name: str) -> Optional[Dict[str, Any]]:
+        """อ่านไฟล์ JSON กลับมา ใช้ยืนยันว่าที่เขียนไปถึงจริง"""
+        headers = await self._headers()
+        if not headers:
+            return None
+        file_id = await self.find_file(name)
+        if not file_id:
+            return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.DRIVE_API_URL}/files/{file_id}",
+                headers=headers,
+                params={"alt": "media"},
+            ) as response:
+                if response.status != 200:
+                    return None
+                try:
+                    return json.loads(await response.text())
+                except json.JSONDecodeError:
+                    logger.warning("ไฟล์ %s บน Drive ไม่ใช่ JSON ที่อ่านได้", name)
+                    return None
+
+
+async def mirror_and_warn(update: Update, user_id: int) -> None:
+    """ส่งสำเนาขึ้น Drive หลังเขียนสำเร็จ และบอกผู้ใช้เมื่อส่งไม่ขึ้น
+
+    เรียกหลังตอบผู้ใช้แล้วเสมอ — งานถูกบันทึกลง SQLite ไปแล้วตั้งแต่ก่อนถึงตรงนี้
+    Drive ล่มจึงไม่ควรทำให้คำสั่งล้มเหลว แต่ก็ต้องไม่เงียบ ไม่งั้นผู้ใช้จะเชื่อว่า
+    ข้อมูลขึ้น Drive แล้วทั้งที่ไม่ได้ขึ้น
+    """
+    if StorageSettings.get_settings(user_id).get("storage_type") != "drive":
+        return
+    if await mirror_to_drive(user_id):
+        return
+    await update.message.reply_text(
+        "⚠️ บันทึกลงบอทแล้ว แต่ส่งขึ้น Google Drive ไม่สำเร็จ\n"
+        "ลอง /mystorage เพื่อดูสถานะการเชื่อมต่อ"
+    )
+
+
+def drive_client_for(user_id: int) -> Optional[GoogleDriveClient]:
+    """สร้าง client จากค่าที่ผู้ใช้ตั้งไว้ คืน None ถ้ายังไม่ได้ต่อ Drive"""
+    settings = StorageSettings.get_settings(user_id)
+    if settings.get("storage_type") != "drive":
+        return None
+    refresh_token = settings.get("google_refresh_token")
+    if not refresh_token:
+        return None
+    return GoogleDriveClient(refresh_token, settings.get("google_drive_folder_id"))
+
+
+async def mirror_to_drive(user_id: int) -> bool:
+    """ส่งข้อมูลของผู้ใช้ขึ้น Drive เป็นไฟล์ JSON ไฟล์เดียว
+
+    SQLite ยังเป็นต้นฉบับเสมอ Drive เป็นสำเนา — ตัวส่งการเตือนกับ /done อ้าง
+    rowid ของ SQLite ถ้าย้ายต้นฉบับไป Drive สองอย่างนั้นพังทันที และการเขียน
+    ที่ล้มเหลวกลางทางจะกลายเป็นข้อมูลหาย ไม่ใช่แค่สำเนาไม่ตรง
+    """
+    client_drive = drive_client_for(user_id)
+    if client_drive is None:
+        return False
+
+    payload = {
+        "user_id": user_id,
+        "exported_at": line_webhook.utc_now(),
+        "tasks": await Storage.get_tasks(user_id),
+        "reminders": await Storage.get_reminders(user_id),
+        "notes": await Storage.get_notes(user_id),
+    }
+
+    try:
+        file_id = await client_drive.write_json(_drive_data_filename(user_id), payload)
+    except Exception:
+        logger.exception("ส่งข้อมูลขึ้น Drive ไม่สำเร็จ (user %s)", user_id)
+        return False
+
+    if not file_id:
+        return False
+
+    # โฟลเดอร์เพิ่งถูกสร้างในรอบนี้ จำไว้จะได้ไม่ต้องค้นหาใหม่ทุกครั้ง
+    if client_drive.folder_id:
+        settings = StorageSettings.get_settings(user_id)
+        if settings.get("google_drive_folder_id") != client_drive.folder_id:
+            StorageSettings.set_drive_folder(user_id, client_drive.folder_id)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -797,6 +1160,8 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+    await mirror_and_warn(update, user_id)
+
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all tasks"""
@@ -855,6 +1220,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if success:
         await update.message.reply_text(f"✅ Task #{task_id} completed! 🎉")
+        await mirror_and_warn(update, user_id)
     else:
         await update.message.reply_text(f"❌ Task #{task_id} not found")
 
@@ -895,6 +1261,8 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+    await mirror_and_warn(update, user_id)
+
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List reminders"""
@@ -931,6 +1299,8 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 **Note Saved!**\n\nID: `{note_id}`",
         parse_mode="Markdown"
     )
+
+    await mirror_and_warn(update, user_id)
 
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,6 +1442,10 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{'✅ ' if current == 'sheets' else ''}📄 Google Sheets",
             callback_data="storage:sheets"
         )],
+        [InlineKeyboardButton(
+            f"{'✅ ' if current == 'drive' else ''}📁 Google Drive",
+            callback_data="storage:drive"
+        )],
         [InlineKeyboardButton("❌ Cancel", callback_data="storage:cancel")]
     ]
     
@@ -1120,6 +1494,33 @@ async def storage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if choice == "drive":
+        # Drive ไม่มีขั้นตอนถามค่าในแชตเลย ต่างจาก Airtable/Sheets — ผู้ใช้กดลิงก์
+        # ยินยอมแล้วเซิร์ฟเวอร์รับ token เอง ไม่มี credential ผ่านแชต
+        consent = line_webhook.google_consent_url(user_id)
+        if not consent:
+            await query.edit_message_text(
+                "📁 **Google Drive**\n\n"
+                "ยังใช้ไม่ได้ — เจ้าของบอทต้องตั้ง `GOOGLE_CLIENT_ID`, "
+                "`GOOGLE_CLIENT_SECRET` และ `PUBLIC_BASE_URL` ก่อน",
+                parse_mode="Markdown"
+            )
+            return
+        # ส่ง URL เป็นปุ่ม ไม่ใช่ลิงก์ Markdown — state ที่เซ็นไว้เป็น base64url ซึ่งมี
+        # "_" ได้ และ urlencode ไม่ escape "_" ให้ พอวางลงใน [ข้อความ](url) ของ
+        # Markdown โหมดเก่า underscore ที่ไม่จับคู่จะทำให้ Telegram ปฏิเสธทั้งข้อความ
+        await query.edit_message_text(
+            "📁 **Google Drive**\n\n"
+            "กดปุ่มข้างล่างเพื่ออนุญาต\n\n"
+            "ลิงก์หมดอายุใน 15 นาที และบอทเห็นเฉพาะไฟล์ที่ตัวเองสร้างเท่านั้น\n"
+            "อนุญาตเสร็จแล้วพิมพ์ /mystorage เพื่อตรวจสอบ",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔗 อนุญาต Google Drive", url=consent)]]
+            ),
+        )
+        return
+
 
 async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current storage configuration"""
@@ -1127,7 +1528,7 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = StorageSettings.get_settings(user_id)
     storage_type = settings.get("storage_type", "local")
     
-    icons = {"local": "📱", "airtable": "📊", "sheets": "📄"}
+    icons = {"local": "📱", "airtable": "📊", "sheets": "📄", "drive": "📁"}
     
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
@@ -1140,7 +1541,13 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif storage_type == "sheets":
         sheet_id = settings.get("google_sheet_id")
         text += f"Sheet: `{escape_code(sheet_id[:20] + '...' if sheet_id else 'ยังไม่ได้ตั้ง')}`"
-    
+    elif storage_type == "drive":
+        # ไม่แสดง refresh token ออกมาเด็ดขาด บอกแค่ว่ามีหรือไม่มี
+        if settings.get("google_refresh_token"):
+            text += f"โฟลเดอร์: `{escape_code(DRIVE_FOLDER_NAME)}`\nสถานะ: เชื่อมต่อแล้ว"
+        else:
+            text += "สถานะ: ยังไม่ได้อนุญาต — พิมพ์ /settings แล้วเลือก Google Drive"
+
     text += "\n\n💡 Use /settings to change"
     
     await update.message.reply_text(text, parse_mode="Markdown")
