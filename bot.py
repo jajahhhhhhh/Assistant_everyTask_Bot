@@ -70,6 +70,43 @@ LANGUAGES = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MARKDOWN ESCAPING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# อักขระที่เปิด entity ใน parse_mode="Markdown" (โหมดเก่าของ Telegram)
+_MD_SPECIALS = ("_", "*", "`", "[")
+
+
+def escape_md(text: Any) -> str:
+    """ทำให้ข้อความของผู้ใช้ปลอดภัยสำหรับ parse_mode="Markdown"
+
+    Telegram ปฏิเสธ "ทั้งข้อความ" ด้วย 400 Can't parse entities ถ้ามี _ * ` [
+    ที่ไม่จับคู่ — งานชื่อ "fix user_id" จึงทำให้ไม่มีคำยืนยันกลับมาเลย และ
+    /tasks ที่มีงานแบบนั้นอยู่แถวเดียว จะพังทั้งรายการ ไม่ใช่แค่แถวนั้น
+
+    escape แล้วโครง Markdown ของเราเอง (**หัวข้อ**, `โค้ด`) ยังทำงานปกติ
+    ส่วนข้อความของผู้ใช้แสดงตามที่พิมพ์มาจริง
+    """
+    if text is None:
+        return ""
+    out = str(text)
+    for ch in _MD_SPECIALS:
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+def escape_code(text: Any) -> str:
+    """ทำให้ข้อความปลอดภัยสำหรับใช้ "ใน" code span
+
+    ข้างใน code span มีแค่ backtick เท่านั้นที่ปิด span ก่อนเวลา และ Markdown
+    โหมดเก่าไม่มีวิธี escape backtick ข้างในได้ จึงต้องแทนด้วยอย่างอื่น
+    """
+    if text is None:
+        return ""
+    return str(text).replace("`", "'")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -614,7 +651,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
     text = f"""
-👋 **สวัสดี {user.first_name}!** Welcome!
+👋 **สวัสดี {escape_md(user.first_name)}!** Welcome!
 
 🤖 I'm **Assistant EveryTask Bot** - Your personal productivity assistant!
 
@@ -733,7 +770,7 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"✅ **Task Added!**\n\n"
-        f"📋 {title}\n"
+        f"📋 {escape_md(title)}\n"
         f"{priority_emoji.get(priority, '⚪')} Priority: {priority}\n\n"
         f"Complete with `/done {task_id}`",
         parse_mode="Markdown"
@@ -764,13 +801,13 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "**📌 To Do:**\n"
         for t in todo[:10]:
             emoji = priority_emoji.get(t["priority"], "⚪")
-            text += f"{emoji} `{t['id']}` {t['title']}\n"
+            text += f"{emoji} `{t['id']}` {escape_md(t['title'])}\n"
         text += "\n"
     
     if doing:
         text += "**⚡ In Progress:**\n"
         for t in doing[:5]:
-            text += f"🔵 `{t['id']}` {t['title']}\n"
+            text += f"🔵 `{t['id']}` {escape_md(t['title'])}\n"
         text += "\n"
     
     if done:
@@ -832,7 +869,7 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"⏰ **Reminder Set!**\n\n"
-        f"📝 {text}\n"
+        f"📝 {escape_md(text)}\n"
         f"🕐 {remind_at.strftime('%Y-%m-%d %H:%M')}",
         parse_mode="Markdown"
     )
@@ -849,7 +886,7 @@ async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "⏰ **Your Reminders**\n\n"
     for r in reminders:
-        text += f"🔔 `{r['id']}` {r['text']}\n   📅 {r['remind_at']}\n\n"
+        text += f"🔔 `{r['id']}` {escape_md(r['text'])}\n   📅 {r['remind_at']}\n\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -887,7 +924,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📝 **Your Notes**\n\n"
     for n in notes[:10]:
         preview = n["content"][:50] + "..." if len(n["content"]) > 50 else n["content"]
-        text += f"`{n['id']}` {preview}\n"
+        text += f"`{n['id']}` {escape_md(preview)}\n"
     
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -917,7 +954,7 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if target_lang not in LANGUAGES:
         await update.message.reply_text(
-            f"❌ Unknown language: `{target_lang}`\n\n"
+            f"❌ Unknown language: `{escape_code(target_lang)}`\n\n"
             f"Available: en, th, zh, ja, ko, vi, id, es, fr, de...",
             parse_mode="Markdown"
         )
@@ -929,8 +966,8 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"🌐 **Translation**\n\n"
-        f"📝 Original: {text}\n\n"
-        f"🎯 {LANGUAGES[target_lang]}: {translated}",
+        f"📝 Original: {escape_md(text)}\n\n"
+        f"🎯 {LANGUAGES[target_lang]}: {escape_md(translated)}",
         parse_mode="Markdown"
     )
 
@@ -976,7 +1013,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             f"🎤 **Voice Transcription**\n\n"
-            f"📝 {transcription}\n\n"
+            f"📝 {escape_md(transcription)}\n\n"
             f"⏱️ Duration: {voice.duration}s",
             parse_mode="Markdown"
         )
@@ -1068,10 +1105,15 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = f"{icons.get(storage_type, '📱')} **Your Storage: {storage_type.title()}**\n\n"
     
+    # ค่าเริ่มต้นของ .get() ใช้ได้แค่ตอน "ไม่มีคีย์" แต่คอลัมน์ในฐานข้อมูลเป็น NULL
+    # ได้ ซึ่งคืน None มา แล้ว None[:20] โยน TypeError — เกิดจริงเมื่อผู้ใช้เลือก
+    # sheets แล้วยังไม่ได้ใส่ id ส่วน escape_code(None) ก็คืนช่องว่างเปล่า ๆ
     if storage_type == "airtable":
-        text += f"Base: `{settings.get('airtable_base_id', 'N/A')}`"
+        base_id = settings.get("airtable_base_id") or "ยังไม่ได้ตั้ง"
+        text += f"Base: `{escape_code(base_id)}`"
     elif storage_type == "sheets":
-        text += f"Sheet: `{settings.get('google_sheet_id', 'N/A')[:20]}...`"
+        sheet_id = settings.get("google_sheet_id")
+        text += f"Sheet: `{escape_code(sheet_id[:20] + '...' if sheet_id else 'ยังไม่ได้ตั้ง')}`"
     
     text += "\n\n💡 Use /settings to change"
     
@@ -1156,9 +1198,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if result["success"]:
                     StorageSettings.set_airtable(user_id, state["api_key"], state["base_id"], table_name)
-                    await update.message.reply_text(f"✅ **Airtable Connected!**\n\n{result['message']}", parse_mode="Markdown")
+                    await update.message.reply_text(f"✅ **Airtable Connected!**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
                 else:
-                    await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+                    await update.message.reply_text(f"❌ **Failed**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
                 
                 user_setup_state.pop(user_id, None)
             return
@@ -1180,7 +1222,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 StorageSettings.set_google_sheets(user_id, text)
                 await update.message.reply_text(f"✅ **Google Sheets Connected!**", parse_mode="Markdown")
             else:
-                await update.message.reply_text(f"❌ **Failed**\n\n{result['message']}", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ **Failed**\n\n{escape_md(result['message'])}", parse_mode="Markdown")
             
             user_setup_state.pop(user_id, None)
             return
