@@ -160,6 +160,35 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/healthz/invariants")
         self.assertEqual(response.status, 200)
 
+    async def test_healthz_survives_concurrent_probes(self):
+        """คำขอซ้อนกันต้องไม่ทำให้ 500
+
+        sqlite3 ผูก connection กับเธรดที่สร้างมัน เดิม _health แยก connect /
+        query / close เป็น asyncio.to_thread คนละครั้ง พอ thread pool แตกเป็น
+        หลายเธรดตอนถูกยิงพร้อมกัน จะได้ ProgrammingError → 500 → Railway
+        รีสตาร์ตวน ซึ่งเป็นสิ่งที่ docstring ของ _health ตั้งใจกันไว้แต่แรก
+        """
+        import asyncio
+
+        responses = await asyncio.gather(
+            *[self.client.get("/healthz") for _ in range(12)]
+        )
+        # อ่าน body ให้ครบก่อน — ปล่อย connection คืน pool ไม่ให้ค้าง
+        payloads = [await response.json() for response in responses]
+        self.assertEqual([r.status for r in responses], [200] * 12)
+        self.assertEqual([p["status"] for p in payloads], ["ok"] * 12)
+
+    async def test_invariants_survives_concurrent_probes(self):
+        """_invariants เคยมีบั๊กข้ามเธรดแบบเดียวกัน"""
+        import asyncio
+
+        responses = await asyncio.gather(
+            *[self.client.get("/healthz/invariants") for _ in range(12)]
+        )
+        payloads = [await response.json() for response in responses]
+        self.assertEqual([r.status for r in responses], [200] * 12)
+        self.assertEqual([p["status"] for p in payloads], ["ok"] * 12)
+
 
 if __name__ == "__main__":
     unittest.main()
