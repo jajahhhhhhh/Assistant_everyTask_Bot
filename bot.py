@@ -400,7 +400,7 @@ class Storage:
         return [{"id": r[0], "text": r[1], "remind_at": r[2], "status": r[3]} for r in rows]
     
     @staticmethod
-    async def get_due_reminders(now: datetime = None) -> List[Dict]:
+    async def get_due_reminders(now: Optional[datetime] = None) -> List[Dict]:
         """การเตือนที่ถึงเวลาแล้วและยังไม่ถูกส่ง
 
         remind_at เก็บเป็น datetime.now().isoformat() คือเวลาท้องถิ่นแบบไม่มี
@@ -1139,7 +1139,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ถี่แค่ไหนถึงจะไปดูว่ามีอะไรครบกำหนด — /remind รับหน่วยเล็กสุดเป็นนาที
-REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30"))
+DEFAULT_REMINDER_POLL_SECONDS = 30
+
+
+def _reminder_poll_seconds() -> int:
+    """อ่าน REMINDER_POLL_SECONDS โดยไม่ยอมให้ค่าที่พิมพ์ผิดล้มทั้งบอท
+
+    int() ตรง ๆ ตอน import แปลว่าพิมพ์ '30s' ไว้ในหน้า Variables แล้วบอททั้งตัว
+    บูตไม่ขึ้น ทั้งที่เรื่องที่ผิดคือความถี่ของการตรวจการเตือนเท่านั้น
+
+    0 หรือค่าติดลบทำให้ APScheduler ยิงรัวไม่หยุด จึงบังคับขั้นต่ำหนึ่งวินาที
+    """
+    raw = os.getenv("REMINDER_POLL_SECONDS")
+    if raw is None:
+        return DEFAULT_REMINDER_POLL_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        logger.warning(
+            "REMINDER_POLL_SECONDS=%r ไม่ใช่ตัวเลข ใช้ %d วินาทีแทน",
+            raw, DEFAULT_REMINDER_POLL_SECONDS,
+        )
+        return DEFAULT_REMINDER_POLL_SECONDS
+    if seconds < 1:
+        logger.warning("REMINDER_POLL_SECONDS=%d น้อยเกินไป ใช้ 1 วินาทีแทน", seconds)
+        return 1
+    return seconds
+
+
+REMINDER_POLL_SECONDS = _reminder_poll_seconds()
 
 _reminder_scheduler: Optional[AsyncIOScheduler] = None
 
@@ -1186,6 +1214,12 @@ def start_reminder_scheduler(application: Application) -> AsyncIOScheduler:
     coalesce กับ max_instances=1 กันไม่ให้รอบที่ค้างสะสมแล้วยิงรัวพร้อมกัน
     """
     global _reminder_scheduler
+
+    # เรียกซ้ำโดยไม่ปิดตัวเก่า = มีสองตัววิ่งพร้อมกัน ผู้ใช้ได้การเตือนซ้ำ และ
+    # ตัวเก่าก็ไม่มีใครอ้างถึงอีกจึงปิดไม่ได้ด้วย
+    if _reminder_scheduler is not None:
+        logger.warning("ตัวส่งการเตือนเริ่มอยู่แล้ว — ปิดตัวเดิมก่อนเริ่มใหม่")
+        stop_reminder_scheduler()
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(

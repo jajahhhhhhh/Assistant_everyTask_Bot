@@ -7,6 +7,7 @@ bot.py แต่ไม่เคยมีใครเรียกใช้ ผล
 """
 
 import asyncio
+import os
 import unittest
 from datetime import datetime, timedelta
 
@@ -128,6 +129,43 @@ class TestDelivery(BotDbCase):
         self.assertEqual(await bot.deliver_due_reminders(OnlyFirstFails()), 1)
 
 
+class TestPollInterval(unittest.TestCase):
+    """ค่าที่พิมพ์ผิดในหน้า Variables ต้องไม่ล้มทั้งบอท"""
+
+    def setUp(self):
+        self._saved = os.environ.get("REMINDER_POLL_SECONDS")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("REMINDER_POLL_SECONDS", None)
+        else:
+            os.environ["REMINDER_POLL_SECONDS"] = self._saved
+
+    def read(self, value):
+        if value is None:
+            os.environ.pop("REMINDER_POLL_SECONDS", None)
+        else:
+            os.environ["REMINDER_POLL_SECONDS"] = value
+        return bot._reminder_poll_seconds()
+
+    def test_unset_uses_the_default(self):
+        self.assertEqual(self.read(None), bot.DEFAULT_REMINDER_POLL_SECONDS)
+
+    def test_a_normal_value_is_honoured(self):
+        self.assertEqual(self.read("120"), 120)
+
+    def test_garbage_falls_back_instead_of_crashing(self):
+        """'30s' ในหน้า Variables ต้องไม่ทำให้บอทบูตไม่ขึ้น"""
+        for value in ("30s", "", "ครึ่งนาที", "1.5"):
+            with self.subTest(value=value):
+                self.assertEqual(self.read(value), bot.DEFAULT_REMINDER_POLL_SECONDS)
+
+    def test_zero_and_negative_are_clamped(self):
+        """0 ทำให้ APScheduler ยิงรัวไม่หยุด"""
+        self.assertEqual(self.read("0"), 1)
+        self.assertEqual(self.read("-5"), 1)
+
+
 class TestSchedulerIsActuallyWired(unittest.IsolatedAsyncioTestCase):
     """เส้นทางบูตจริงต้องเริ่มตัวส่งการเตือน
 
@@ -163,6 +201,20 @@ class TestSchedulerIsActuallyWired(unittest.IsolatedAsyncioTestCase):
         # APScheduler 3.11 ยังรายงาน running เป็น True หลัง shutdown จึงตรวจสิ่งที่
         # สังเกตได้จริงแทน คือไม่เหลืองานให้ยิงอีก
         self.assertEqual(scheduler.get_jobs(), [])
+
+    async def test_starting_twice_does_not_leave_two_running(self):
+        """สองตัววิ่งพร้อมกัน = ผู้ใช้ได้การเตือนซ้ำ และตัวเก่าปิดไม่ได้อีกเลย"""
+        class FakeApplication:
+            bot = FakeBot()
+
+        first = bot.start_reminder_scheduler(FakeApplication())
+        second = bot.start_reminder_scheduler(FakeApplication())
+        try:
+            self.assertIsNot(first, second)
+            self.assertEqual(first.get_jobs(), [], "ตัวเดิมต้องถูกปิดไปแล้ว")
+            self.assertIsNotNone(second.get_job("deliver_due_reminders"))
+        finally:
+            bot.stop_reminder_scheduler()
 
     async def test_stopping_twice_is_harmless(self):
         bot.stop_reminder_scheduler()
