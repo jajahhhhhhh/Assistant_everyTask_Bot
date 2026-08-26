@@ -63,6 +63,12 @@ async def start_telegram():
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # initialize() ไม่เรียก post_init (มีแต่ run_polling/run_webhook ที่เรียก)
+    # ตัวส่งการเตือนจึงต้องถูกเริ่มตรงนี้ ไม่งั้น /remind จะเก็บลงฐานข้อมูลแล้ว
+    # ไม่มีใครมารับ เหมือนที่เป็นมาตลอด
+    bot.start_reminder_scheduler(application)
+
     logger.info("Telegram bot เริ่ม polling แล้ว")
     return application
 
@@ -159,6 +165,9 @@ async def run() -> None:
         logger.info("ได้รับสัญญาณให้ปิด — กำลังเก็บงานที่ค้าง")
     finally:
         if application is not None:
+            import bot   # start_telegram() import ไปแล้ว ตรงนี้จึงได้โมดูลเดิม
+
+            bot.stop_reminder_scheduler()
             await application.updater.stop()
             await application.stop()
             await application.shutdown()
