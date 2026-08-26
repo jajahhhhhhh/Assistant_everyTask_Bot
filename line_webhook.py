@@ -1265,6 +1265,21 @@ def _build_reno_bridge():
     return bridge
 
 
+def _drift_snapshot(db_path: str) -> List[Dict[str, Any]]:
+    """เปิด–ถาม–ปิด ฐานข้อมูลให้จบในเธรดเดียว
+
+    sqlite3 ผูก connection ไว้กับเธรดที่สร้างมัน (check_same_thread เป็น True
+    ตามค่าเริ่มต้น) การแยก connect / query / close ออกเป็น asyncio.to_thread
+    คนละครั้ง จึงพังทันทีที่ thread pool แตกเป็นหลายเธรด — ซึ่งเกิดขึ้นเมื่อ
+    health check ถูกยิงซ้อนกัน ทำให้ /healthz ตอบ 500 แล้ว Railway รีสตาร์ตวน
+    """
+    conn = connect(db_path)
+    try:
+        return check_block_invariant(conn)
+    finally:
+        conn.close()
+
+
 async def _health(request: web.Request) -> web.Response:
     """liveness — ตอบ 200 ตราบใดที่ยังเปิดฐานข้อมูลได้
 
@@ -1274,24 +1289,17 @@ async def _health(request: web.Request) -> web.Response:
     """
     handler: LineWebhookHandler = request.app["line_handler"]
     try:
-        conn = await asyncio.to_thread(connect, handler.db_path)
+        drift = await asyncio.to_thread(_drift_snapshot, handler.db_path)
     except sqlite3.Error as exc:
+        # ครอบทั้งการเปิดและการถาม — ข้อผิดพลาดของ sqlite ต้องไม่กลายเป็น 500
         return web.json_response({"status": "error", "error": str(exc)}, status=503)
-    try:
-        drift = await asyncio.to_thread(check_block_invariant, conn)
-    finally:
-        await asyncio.to_thread(conn.close)
     return web.json_response({"status": "ok", "block_pointer_drift": len(drift)})
 
 
 async def _invariants(request: web.Request) -> web.Response:
     """E3 จาก sql/04_queries.sql — 500 พร้อมรายการงานที่ตัวชี้เพี้ยน"""
     handler: LineWebhookHandler = request.app["line_handler"]
-    conn = await asyncio.to_thread(connect, handler.db_path)
-    try:
-        drift = await asyncio.to_thread(check_block_invariant, conn)
-    finally:
-        await asyncio.to_thread(conn.close)
+    drift = await asyncio.to_thread(_drift_snapshot, handler.db_path)
     return web.json_response(
         {"status": "ok" if not drift else "drift", "block_pointer_drift": drift},
         status=200 if not drift else 500,
