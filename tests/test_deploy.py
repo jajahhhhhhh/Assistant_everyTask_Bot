@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
@@ -21,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import line_webhook as lw
+import app
 
 
 class TestSchemaBootstrap(unittest.TestCase):
@@ -112,6 +114,110 @@ class TestProcessConfig(unittest.TestCase):
         source = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
         self.assertIn("start_web", source)
         self.assertIn("start_telegram", source)
+
+
+class TestBootStorageReport(unittest.TestCase):
+    """ตอนบูตต้องบอกให้ชัดว่าข้อมูลจะไปอยู่ไหน
+
+    เคสจริงที่เกิดมาแล้ว: DATA_DIR=/data ถูกตั้งไว้ แต่มี DATABASE_PATH=data/assistant.db
+    ค้างอยู่ ไฟล์จริงจึงเป็น /app/data/assistant.db ที่หายทุก deploy ส่วน volume
+    นอนว่าง ไม่มีอะไรผิดพลาดให้เห็นเลยสักอย่าง
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved = (lw.DB_PATH, os.environ.get("DATABASE_PATH"), os.environ.get("DATA_DIR"))
+        lw.DB_PATH = str(Path(self._tmp.name) / "assistant.db")
+
+    def tearDown(self):
+        lw.DB_PATH = self._saved[0]
+        for key, value in (("DATABASE_PATH", self._saved[1]), ("DATA_DIR", self._saved[2])):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._tmp.cleanup()
+
+    def report(self, db_path=None, on_volume=False):
+        """รันรายงาน โดยกำหนดผลของการเทียบ device เอง
+
+        ผลจริงขึ้นกับว่าเครื่องที่รันเทสต์ mount /tmp แยกหรือไม่ — เครื่องนี้ไม่แยก
+        แต่ runner หลายตัว /tmp เป็น tmpfs คนละอุปกรณ์ ปล่อยให้ขึ้นกับสภาพเครื่อง
+        เท่ากับเขียนเทสต์ที่ผ่านหรือแดงตามว่าไปรันที่ไหน
+        """
+        import bot
+
+        original = bot.DB_PATH
+        bot.DB_PATH = db_path or lw.DB_PATH
+        try:
+            with mock.patch.object(app, "data_dir_is_persistent", return_value=on_volume):
+                with self.assertLogs("app", level="INFO") as captured:
+                    app.describe_storage()
+            return "\n".join(captured.output)
+        finally:
+            bot.DB_PATH = original
+
+    def test_always_logs_the_absolute_path(self):
+        """path ที่ log ต้องเป็น absolute — 'data/assistant.db' ไม่บอกอะไรเลย"""
+        self.assertIn(str(Path(self._tmp.name) / "assistant.db"), self.report())
+
+    def test_warns_when_database_path_is_relative(self):
+        os.environ["DATABASE_PATH"] = "data/assistant.db"
+        os.environ["DATA_DIR"] = "/data"
+        output = self.report()
+        self.assertIn("WARNING", output)
+        self.assertIn("สัมพัทธ์", output)
+        self.assertIn("/data", output)      # ต้องบอกด้วยว่าอะไรถูกทับ
+
+    def test_quiet_when_database_path_is_absolute(self):
+        os.environ["DATABASE_PATH"] = "/data/assistant.db"
+        self.assertNotIn("สัมพัทธ์", self.report())
+
+    def test_errors_when_the_two_sides_disagree(self):
+        """สองฝั่งเขียนคนละไฟล์ = ข้อมูลแตกสองชุดโดยไม่มีใครรู้"""
+        output = self.report(db_path=str(Path(self._tmp.name) / "อีกไฟล์.db"))
+        self.assertIn("ERROR", output)
+        self.assertIn("คนละไฟล์", output)
+
+    def test_warns_when_the_data_directory_is_not_a_volume(self):
+        output = self.report(on_volume=False)
+        self.assertIn("WARNING", output)
+        self.assertIn("จะหายเมื่อ deploy", output)
+
+    def test_says_so_when_the_data_directory_is_a_volume(self):
+        """สาขาที่ควรเกิดหลังตั้งค่าถูก — ต้องยืนยันให้เห็น ไม่ใช่เงียบ"""
+        output = self.report(on_volume=True)
+        self.assertIn("อยู่บน volume", output)
+        self.assertNotIn("จะหายเมื่อ deploy", output)
+
+    def test_the_device_check_reads_the_real_filesystem(self):
+        """ฟังก์ชันที่เทสต์อื่น mock ไว้ ต้องมีตัวหนึ่งที่ยืนยันของจริง
+
+        ไม่งั้น mock ทุกที่แล้วไม่มีใครตรวจว่าการเทียบ st_dev ทำงานถูกจริง
+        """
+        self.assertFalse(app.data_dir_is_persistent("/"))
+
+        # หาโฟลเดอร์ที่อยู่คนละอุปกรณ์กับ / จริง ๆ — ไม่ผูกกับ path ใด path หนึ่ง
+        # เพราะเครื่องต่างกัน mount ไม่เหมือนกัน
+        elsewhere = next(
+            (p for p in ("/proc", "/sys", "/dev", "/dev/shm", "/run")
+             if os.path.exists(p) and os.stat(p).st_dev != os.stat("/").st_dev),
+            None,
+        )
+        if elsewhere is None:
+            self.skipTest("เครื่องนี้ไม่มี filesystem แยกให้ทดสอบสาขาบวก")
+        self.assertTrue(app.data_dir_is_persistent(elsewhere))
+
+    def test_still_answers_when_the_directory_does_not_exist_yet(self):
+        """โฟลเดอร์ข้อมูลถูกสร้างใน start_web() ซึ่งรันหลังจากนี้
+
+        ตอนบูตครั้งแรกโฟลเดอร์จึงยังไม่มี ถ้าไม่ไต่ขึ้นไปหาโฟลเดอร์แม่ จะได้
+        "ตรวจไม่ได้" แทนคำเตือนที่ต้องการ ซึ่งคือกรณีที่เจอจริง
+        """
+        lw.DB_PATH = str(Path(self._tmp.name) / "ยังไม่มี" / "assistant.db")
+        output = self.report()
+        self.assertNotIn("ตรวจไม่ได้", output)
+        self.assertIn("จะหายเมื่อ deploy", output)
 
 
 class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
