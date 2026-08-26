@@ -990,24 +990,31 @@ class LineWebhookHandler:
 
     # ── จังหวะ 4-7: เบื้องหลัง ───────────────────────────────────────────────
     async def _process(self, job: _Job) -> None:
-        conn = await asyncio.to_thread(connect, self.db_path)
+        # ทุกขั้นเปิด connection ของตัวเองผ่าน _with_connection — ห้ามถือ
+        # connection เดียวข้ามหลาย asyncio.to_thread (sqlite ผูกกับเธรด)
         try:
             replies: List[str] = []
 
             if job.kind == "message":
                 # จังหวะ 4 — คัดแยกแล้วเติมกลับลงแถวเดิม
                 result = await self._classify(job)
-                await asyncio.to_thread(apply_classification, conn, job.message_id, result)
+                await asyncio.to_thread(
+                    _with_connection, self.db_path, apply_classification, job.message_id, result
+                )
 
                 # จังหวะ 5 — ปลดการรอ ก่อนจะไปคิดเรื่องตอบกลับ
                 # ต้องเกิดแม้การตอบกลับจะล้มเหลว เพราะ "เขาตอบแล้ว" เป็นข้อเท็จจริง
                 # ที่ไม่ได้ขึ้นกับว่าเราส่งข้อความออกได้หรือไม่
-                released = await asyncio.to_thread(self._release, conn, job)
+                released = await asyncio.to_thread(
+                    _with_connection, self.db_path, self._release, job
+                )
                 if released:
                     replies.append(self._released_text(released))
 
                 # จังหวะ 6 — คำสั่งของเจ้าของ
-                command_reply = await asyncio.to_thread(self._run_owner_command, conn, job)
+                command_reply = await asyncio.to_thread(
+                    _with_connection, self.db_path, self._run_owner_command, job
+                )
                 if command_reply:
                     replies.append(command_reply)
 
@@ -1015,7 +1022,9 @@ class LineWebhookHandler:
                 # อยู่หลังจังหวะ 5 เสมอ: การปลดการรอเป็นข้อเท็จจริงของแชท ส่วน
                 # รายการที่เดาได้จากข้อความยังต้องรอเจ้าของยืนยันก่อนเข้า dashboard
                 if self.reno is not None:
-                    reno_reply = await asyncio.to_thread(self._run_reno, conn, job)
+                    reno_reply = await asyncio.to_thread(
+                        _with_connection, self.db_path, self._run_reno, job
+                    )
                     if reno_reply:
                         replies.append(reno_reply)
 
@@ -1023,22 +1032,22 @@ class LineWebhookHandler:
                 replies.append(WELCOME_TEXT)
 
             await asyncio.to_thread(
-                finish_delivery, conn, job.event_id, "processed", chat_message_id=job.message_id
+                _with_connection, self.db_path, finish_delivery,
+                job.event_id, "processed", chat_message_id=job.message_id,
             )
 
             # จังหวะ 7
             if replies:
-                await self._respond(conn, job, "\n\n".join(replies))
+                await self._respond(job, "\n\n".join(replies))
         except Exception as exc:
             logger.exception("ประมวลผล event %s ไม่สำเร็จ", job.event_id)
             try:
                 await asyncio.to_thread(
-                    finish_delivery, conn, job.event_id, "failed", error=str(exc)
+                    _with_connection, self.db_path, finish_delivery,
+                    job.event_id, "failed", error=str(exc),
                 )
             except Exception:
                 logger.exception("อัปเดตสถานะ delivery ไม่สำเร็จ")
-        finally:
-            await asyncio.to_thread(conn.close)
 
     async def _classify(self, job: _Job) -> Dict[str, Any]:
         """ให้ตัวคัดแยกทำงานภายในงบเวลาของ reply token
@@ -1143,7 +1152,7 @@ class LineWebhookHandler:
             logger.exception("reno bridge ล้มเหลวสำหรับข้อความ %s", job.message_id)
             return None
 
-    async def _respond(self, conn: sqlite3.Connection, job: _Job, text: str) -> None:
+    async def _respond(self, job: _Job, text: str) -> None:
         """จังหวะ 7 — ส่งก่อน แล้วค่อยบันทึก
 
         ลำดับนี้กลับกับข้อความขาเข้าโดยตั้งใจ: ขาเข้าต้องบันทึกก่อนตอบ 200 เพราะ
@@ -1173,8 +1182,9 @@ class LineWebhookHandler:
         # ข้อความตอบรับของบอทไม่ใช่คำตอบของเจ้าของ — ไม่ควรไปปิด responded_at
         if self.log_bot_acks:
             await asyncio.to_thread(
+                _with_connection,
+                self.db_path,
                 insert_outbound_message,
-                conn,
                 thread_id=job.thread_id,
                 body=text,
                 sent_at=utc_now(),
@@ -1276,6 +1286,25 @@ def _drift_snapshot(db_path: str) -> List[Dict[str, Any]]:
     conn = connect(db_path)
     try:
         return check_block_invariant(conn)
+    finally:
+        conn.close()
+
+
+def _with_connection(db_path: str, fn, *args, **kwargs):
+    """เปิด connection ของตัวเอง เรียก fn แล้วปิด — จบในเธรดเดียว
+
+    sqlite3 ผูก connection กับเธรดที่สร้างมัน (check_same_thread เป็น True ตาม
+    ค่าเริ่มต้น) การถือ connection เดียวแล้วส่งข้าม asyncio.to_thread หลายครั้ง
+    จึงพังทันทีที่ thread pool แตกเป็นหลายเธรด
+
+    ทุกขั้นใน _process commit ของตัวเองอยู่แล้ว (finish_delivery,
+    apply_classification, insert_outbound_message ต่างเรียก conn.commit())
+    ไม่มี transaction คร่อมหลายขั้น การเปิด connection ใหม่ต่อขั้นจึงให้ผล
+    เหมือนเดิมทุกประการ
+    """
+    conn = connect(db_path)
+    try:
+        return fn(conn, *args, **kwargs)
     finally:
         conn.close()
 

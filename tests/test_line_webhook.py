@@ -398,6 +398,50 @@ class TestWaitLifecycle(WebhookCase):
         self.assert_no_pointer_drift()
 
 
+class TestConcurrentEvents(WebhookCase):
+    """หลาย event ในชุดเดียวต้องประมวลผลครบทุกตัว
+
+    _process เคยเปิด connection เดียวแล้วส่งข้าม asyncio.to_thread หลายครั้ง
+    (apply_classification, _release, _run_owner_command, _run_reno,
+    finish_delivery) พอ event เข้ามาพร้อมกัน thread pool แตกเป็นหลายเธรด
+    sqlite จึงโยน ProgrammingError กลางทาง ผลคือข้อความถูกบันทึกใน
+    chat_messages แต่จังหวะ 4-7 ตายเงียบ ๆ — ไม่ปลดการรอ ไม่ทำคำสั่ง
+    ไม่ตอบกลับ และแถว delivery ค้างที่ received
+    """
+
+    async def test_every_event_in_a_batch_is_processed(self):
+        events = [
+            message_event(event_id=f"conc{i}", user_id=FARID, text=f"ข้อความที่ {i}")
+            for i in range(8)
+        ]
+        await self.post(events)
+
+        self.assertEqual(len(self.query("SELECT id FROM chat_messages")), 8)
+
+        statuses = self.query(
+            "SELECT status, COUNT(*) AS n FROM line_webhook_deliveries GROUP BY status"
+        )
+        self.assertEqual(
+            {row["status"]: row["n"] for row in statuses},
+            {"processed": 8},
+            "จังหวะ 4-7 ต้องจบครบทุก event ไม่ค้างที่ received และไม่ failed",
+        )
+
+    async def test_waits_still_close_when_events_arrive_together(self):
+        """การปลดการรอต้องไม่หายไปเพราะ event เข้ามาพร้อมกัน"""
+        self.open_wait()
+        events = [
+            message_event(event_id=f"batch{i}", user_id=FARID, text=f"ครับ {i}")
+            for i in range(6)
+        ]
+        await self.post(events)
+
+        blocks = self.query("SELECT * FROM task_blocks")
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNotNone(blocks[0]["unblocked_at"], "การรอต้องถูกปลด")
+        self.assert_no_pointer_drift()
+
+
 class TestOwnerCommands(WebhookCase):
     async def test_create_task_links_back_to_the_message(self):
         await self.post([message_event(event_id="c1", user_id=OWNER, text="งาน: ตามใบเสนอราคา")])
