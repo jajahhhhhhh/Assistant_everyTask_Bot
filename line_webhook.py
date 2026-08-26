@@ -48,6 +48,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
@@ -137,28 +138,58 @@ def connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+SQL_DIR = Path(__file__).resolve().parent / "sql"
+
+
 def init_webhook_tables(db_path: str = DB_PATH) -> None:
-    """สร้างตารางประปาของ webhook และตรวจว่า 01_schema.sql ถูกรันแล้ว"""
+    """สร้างตารางที่ webhook ต้องใช้ และลง schema ให้เองถ้าฐานข้อมูลยังว่าง
+
+    คอนเทนเนอร์บน Railway เกิดใหม่ทุกครั้งที่ deploy ถ้ารอให้คนไปรัน
+    sql/01_schema.sql เองก่อน เว็บจะบูตไม่ขึ้นทุกรอบ จึงลงให้อัตโนมัติเมื่อ
+    ยังไม่มีตาราง และไม่แตะอะไรเลยถ้ามีอยู่แล้ว (ทุกไฟล์ใช้ IF NOT EXISTS)
+    """
     directory = os.path.dirname(db_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     conn = connect(db_path)
     try:
-        existing = {
-            row["name"]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        missing = [name for name in REQUIRED_TABLES if name not in existing]
+        if _missing_tables(conn):
+            _bootstrap_schema(conn, db_path)
+        missing = _missing_tables(conn)
         if missing:
             raise RuntimeError(
-                f"ฐานข้อมูล {db_path} ยังไม่มีตาราง {', '.join(missing)} — "
-                "รัน sql/01_schema.sql (และ 02_views.sql) ก่อน"
+                f"ฐานข้อมูล {db_path} ยังไม่มีตาราง {', '.join(missing)} "
+                f"และลง schema เองไม่ได้ (ไม่พบ {SQL_DIR}) — รัน sql/01_schema.sql ก่อน"
             )
         conn.executescript(PLUMBING_SCHEMA)
         conn.commit()
     finally:
         conn.close()
     logger.info("LINE webhook plumbing ready at %s", db_path)
+
+
+def _missing_tables(conn: sqlite3.Connection) -> List[str]:
+    existing = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    return [name for name in REQUIRED_TABLES if name not in existing]
+
+
+def _bootstrap_schema(conn: sqlite3.Connection, db_path: str) -> None:
+    """ลง 01_schema.sql แล้วตามด้วย 02_views.sql (view เป็นของที่รายงานใช้)"""
+    schema_file = SQL_DIR / "01_schema.sql"
+    if not schema_file.is_file():
+        return
+    logger.info("ฐานข้อมูล %s ยังว่าง — ลง schema จาก %s", db_path, SQL_DIR)
+    conn.executescript(schema_file.read_text(encoding="utf-8"))
+    views_file = SQL_DIR / "02_views.sql"
+    if views_file.is_file():
+        try:
+            conn.executescript(views_file.read_text(encoding="utf-8"))
+        except sqlite3.Error as exc:
+            # view พังไม่ควรทำให้ webhook บูตไม่ขึ้น — ข้อความยังบันทึกได้
+            logger.error("ลง 02_views.sql ไม่สำเร็จ: %s", exc)
+    conn.commit()
 
 
 def utc_now() -> str:
@@ -1235,7 +1266,26 @@ def _build_reno_bridge():
 
 
 async def _health(request: web.Request) -> web.Response:
-    """สุขภาพของ webhook = ตัวชี้บน tasks ตรงกับ task_blocks ไหม (E3)"""
+    """liveness — ตอบ 200 ตราบใดที่ยังเปิดฐานข้อมูลได้
+
+    ตั้งใจไม่ให้ 500 เพราะข้อมูลไม่สอดคล้อง: health check ของ Railway ผูกกับ
+    endpoint นี้ ถ้าตอบ 500 ตอนตัวชี้เพี้ยน คอนเทนเนอร์จะถูกรีสตาร์ตวนไปเรื่อย ๆ
+    ทั้งที่ webhook ยังรับข้อความได้ปกติ — ดูความสอดคล้องที่ /healthz/invariants
+    """
+    handler: LineWebhookHandler = request.app["line_handler"]
+    try:
+        conn = await asyncio.to_thread(connect, handler.db_path)
+    except sqlite3.Error as exc:
+        return web.json_response({"status": "error", "error": str(exc)}, status=503)
+    try:
+        drift = await asyncio.to_thread(check_block_invariant, conn)
+    finally:
+        await asyncio.to_thread(conn.close)
+    return web.json_response({"status": "ok", "block_pointer_drift": len(drift)})
+
+
+async def _invariants(request: web.Request) -> web.Response:
+    """E3 จาก sql/04_queries.sql — 500 พร้อมรายการงานที่ตัวชี้เพี้ยน"""
     handler: LineWebhookHandler = request.app["line_handler"]
     conn = await asyncio.to_thread(connect, handler.db_path)
     try:
@@ -1262,6 +1312,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     app["line_handler"] = handler
     app.router.add_post(WEBHOOK_PATH, handler.handle)
     app.router.add_get("/healthz", _health)
+    app.router.add_get("/healthz/invariants", _invariants)
 
     async def _cleanup(app: web.Application) -> None:
         await app["line_handler"].close()

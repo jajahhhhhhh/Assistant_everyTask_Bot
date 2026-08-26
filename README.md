@@ -51,10 +51,45 @@ Just send any voice message → Auto-transcribed by AI!
 
 ## Deploy to Railway
 
-1. Fork this repo
-2. Connect to Railway
-3. Set environment variables
-4. Deploy!
+ทั้ง Telegram bot และ LINE webhook รันในโปรเซสเดียว (`app.py`) — ทั้งคู่เขียน
+SQLite ไฟล์เดียวกัน และ volume ของ Railway ผูกกับ service เดียว ถ้าแยกสอง service
+ฝั่งหนึ่งจะเขียนลงดิสก์ที่หายทุก deploy
+
+1. **New Project → Deploy from GitHub repo** เลือกรีโปนี้ (branch `main`)
+2. **Variables** — ใส่อย่างน้อยหนึ่งฝั่ง จะเปิดทั้งสองฝั่งพร้อมกันก็ได้
+
+   | ตัวแปร | ใช้ทำอะไร |
+   |---|---|
+   | `TELEGRAM_BOT_TOKEN` | เปิด Telegram bot (ไม่ใส่ = ข้ามส่วนนี้) |
+   | `LINE_CHANNEL_SECRET` + `LINE_CHANNEL_ACCESS_TOKEN` | เปิดการรับ webhook ของ LINE |
+   | `LINE_OWNER_USER_ID` | LINE user id ของเจ้าของ — คำสั่งในแชทรับจากคนนี้เท่านั้น |
+   | `OPENAI_API_KEY` | แปลภาษา + ถอดเสียงใน Telegram bot |
+   | `DATA_DIR` | ตั้งเป็น `/data` ให้ตรงกับ volume (ดูข้อ 3) |
+   | `RENO_BRIDGE` | `1` ถ้าจะต่อกับ Reno Dashboard (ดู [RENO_BRIDGE.md](RENO_BRIDGE.md)) |
+
+   `PORT` Railway ใส่ให้เอง ไม่ต้องตั้ง
+
+3. **Volume** — Settings → Volumes → Add, mount path `/data` แล้วตั้ง `DATA_DIR=/data`
+   ⚠️ ข้ามข้อนี้แล้วงาน แชท และประวัติการรอทั้งหมดจะหายทุกครั้งที่ deploy
+   เพราะดิสก์ของคอนเทนเนอร์ไม่ถาวร
+
+4. **Deploy** — schema (`sql/01_schema.sql` + `02_views.sql`) ถูกลงให้อัตโนมัติ
+   ตอนบูตครั้งแรก ไม่ต้องรันเอง
+
+5. **Generate Domain** (Settings → Networking) แล้วเอา URL ไปตั้งใน
+   LINE Developers → Messaging API → Webhook URL เป็น `https://<โดเมน>/webhook/line`
+   กด **Verify** แล้วเปิด **Use webhook** (ปิด Auto-reply messages)
+
+### เช็คว่าขึ้นแล้ว
+
+```bash
+curl https://<โดเมน>/healthz              # {"status":"ok","block_pointer_drift":0}
+curl https://<โดเมน>/healthz/invariants   # 500 ถ้าตัวชี้ tasks/task_blocks เพี้ยน (E3)
+```
+
+`/healthz` คือ health check ของ Railway จึงตอบ 200 ตลอดตราบใดที่ยังเปิดฐานข้อมูลได้
+ส่วนความสอดคล้องของข้อมูลดูที่ `/healthz/invariants` — แยกกันเพื่อไม่ให้ข้อมูลเพี้ยน
+ทำให้คอนเทนเนอร์ถูกรีสตาร์ตวน
 
 ## Tech Stack
 

@@ -29,7 +29,8 @@ import aiohttp
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATA_DIR = os.getenv("DATA_DIR", "data")
-DB_PATH = f"{DATA_DIR}/assistant.db"
+# ต้องเป็นไฟล์เดียวกับที่ line_webhook.py ใช้ ไม่งั้นสองส่วนเขียนคนละฐาน
+DB_PATH = os.getenv("DATABASE_PATH", f"{DATA_DIR}/assistant.db")
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1104,10 +1105,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    """Start the bot"""
-    init_db()
-    
+def build_application() -> Application:
+    """Build the Telegram application with every handler registered.
+
+    Separate from main() so app.py can run it inside its own event loop
+    alongside the LINE webhook.
+    """
     app = Application.builder().token(BOT_TOKEN).build()
     
     # Command handlers
@@ -1135,6 +1138,14 @@ def main():
     
     # Text handler (last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    return app
+
+
+def main():
+    """Start the bot on its own (app.py runs it together with the webhook)"""
+    init_db()
+    app = build_application()
     
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
