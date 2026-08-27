@@ -145,6 +145,53 @@ def escape_code(text: Any) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ข้อความ error ที่ส่งให้ผู้ใช้
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ข้อความที่ผู้ให้บริการภายนอกใช้บอกว่า credential ไม่ผ่าน
+_AUTH_ERROR_MARKERS = (
+    "invalid_api_key",
+    "incorrect api key",
+    "invalid authentication",
+    "unauthorized",
+)
+
+
+def _looks_like_auth_error(exc: BaseException) -> bool:
+    """แยกกรณี "คีย์ผิด" ออกจาก error อื่น เพื่อบอกทางแก้ให้ตรงจุด
+
+    ดู status code ก่อน เพราะเชื่อถือได้กว่าการอ่านข้อความ ส่วนการค้นข้อความใช้
+    เป็นทางสำรองสำหรับไลบรารีที่ไม่ได้แนบ status มาให้ — ข้อความจาก exception ถูก
+    "อ่าน" ตรงนี้เท่านั้น ไม่เคยถูกส่งต่อให้ผู้ใช้
+    """
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 401:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _AUTH_ERROR_MARKERS)
+
+
+def api_failure_message(exc: BaseException, action: str, key_name: str = "") -> str:
+    """คืนข้อความที่ปลอดภัยสำหรับผู้ใช้ และเก็บรายละเอียดจริงไว้ใน log
+
+    เดิมโค้ดส่ง str(exc) กลับไปให้ผู้ใช้ตรง ๆ ซึ่งพาของที่ไม่ควรออกไปด้วย —
+    ตอน OPENAI_API_KEY ผิด OpenAI ตอบกลับมาพร้อมคีย์ที่มาสก์ไว้บางส่วน แล้วบอท
+    ก็เอาไปโพสต์ลงแชต Telegram ให้ค้างอยู่ในประวัติ ข้อความจากผู้ให้บริการภายนอก
+    ไม่ควรถูกส่งต่อดิบ ๆ ไม่ว่ากรณีใด
+    """
+    # ส่ง exc เข้า exc_info ตรง ๆ ไม่ใช่ logger.exception() ที่อ่านจาก sys.exc_info()
+    # — แบบนั้นได้รายละเอียดเฉพาะตอนถูกเรียกจากใน except block ถ้าวันหนึ่งมีใคร
+    # เรียกจากที่อื่น รายละเอียดจะหายเงียบ ๆ ซึ่งเป็นสิ่งเดียวกับที่ฟังก์ชันนี้
+    # มีไว้เพื่อป้องกัน
+    logger.error("%s ไม่สำเร็จ: %s", action, exc, exc_info=exc)
+    if _looks_like_auth_error(exc):
+        if key_name:
+            return f"❌ {action}ไม่สำเร็จ — {key_name} ใช้ไม่ได้ ผู้ดูแลบอทต้องตรวจสอบ"
+        return f"❌ {action}ไม่สำเร็จ — credential ใช้ไม่ได้"
+    return f"❌ {action}ไม่สำเร็จ ลองใหม่อีกครั้ง (รายละเอียดอยู่ใน log ของเซิร์ฟเวอร์)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -436,7 +483,8 @@ class AirtableClient:
                     else:
                         return {"success": False, "message": f"❌ Error: {response.status}"}
         except Exception as e:
-            return {"success": False, "message": f"❌ Error: {str(e)}"}
+            return {"success": False,
+                    "message": api_failure_message(e, "เชื่อมต่อ Airtable", "Airtable API Key")}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -459,7 +507,7 @@ class GoogleSheetsClient:
                     else:
                         return {"success": False, "message": "❌ Sheet not accessible. Make sure it's shared publicly."}
         except Exception as e:
-            return {"success": False, "message": f"❌ Error: {str(e)}"}
+            return {"success": False, "message": api_failure_message(e, "เชื่อมต่อ Google Sheets")}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -554,7 +602,7 @@ class GoogleDriveClient:
                         return {"success": False, "message": "❌ Token ใช้ไม่ได้แล้ว"}
                     return {"success": False, "message": f"❌ Error: {response.status}"}
         except Exception as e:
-            return {"success": False, "message": f"❌ Error: {str(e)}"}
+            return {"success": False, "message": api_failure_message(e, "เชื่อมต่อ Google Drive")}
 
     async def ensure_folder(self) -> Optional[str]:
         """หาโฟลเดอร์ของบอท ถ้ายังไม่มีก็สร้าง แล้วคืน id"""
@@ -980,8 +1028,7 @@ async def translate_text(text: str, target_lang: str, source_lang: str = "auto")
         response = await asyncio.to_thread(do_translate)
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Translation error: {e}")
-        return f"❌ Translation error: {str(e)}"
+        return api_failure_message(e, "แปลภาษา", "OPENAI_API_KEY")
 
 
 async def transcribe_voice(file_path: str) -> str:
@@ -990,22 +1037,23 @@ async def transcribe_voice(file_path: str) -> str:
         return "❌ OpenAI API not configured"
     
     import asyncio
-    
-    try:
-        # Run synchronous OpenAI call in thread pool
-        def do_transcribe():
-            with open(file_path, "rb") as audio_file:
-                return client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text"
-                )
-        
-        response = await asyncio.to_thread(do_transcribe)
-        return response.strip()
-    except Exception as e:
-        logger.error(f"Transcription error: {e}")
-        return f"❌ Transcription error: {str(e)}"
+
+    # ไม่จับ exception ตรงนี้ ปล่อยให้ทะลุไปถึง handle_voice
+    #
+    # เดิมจับไว้แล้วคืนข้อความ error เป็น "ผลการถอดเสียง" ผลคือความล้มเหลวถูกบันทึก
+    # ลงตาราง transcriptions เป็น original_text เหมือนเป็นข้อความจริง แล้วถูกแสดง
+    # ใต้หัวข้อ "Voice Transcription" ราวกับถอดเสียงสำเร็จ ผู้เรียกต้องแยกให้ออกว่า
+    # สำเร็จหรือล้มเหลว ซึ่งทำไม่ได้ถ้าทั้งสองกรณีคืน str เหมือนกัน
+    def do_transcribe():
+        with open(file_path, "rb") as audio_file:
+            return client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+
+    response = await asyncio.to_thread(do_transcribe)
+    return response.strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1408,8 +1456,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     except Exception as e:
-        logger.error(f"Voice handling error: {e}")
-        await update.message.reply_text(f"❌ Could not transcribe: {str(e)}")
+        await update.message.reply_text(api_failure_message(e, "ถอดเสียง", "OPENAI_API_KEY"))
     finally:
         # เดิมลบไฟล์หลังถอดเสียงเสร็จ ถ้าถอดเสียงพังไฟล์ .ogg จะค้างทุกครั้ง
         if temp_path is not None:

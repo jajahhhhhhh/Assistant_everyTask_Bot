@@ -96,10 +96,17 @@ class TestTranslate(ClientCase):
         bot.client = None
         self.assertIn("not configured", await bot.translate_text("Hello", "th"))
 
-    async def test_api_errors_are_reported_not_raised(self):
+    async def test_api_errors_are_reported_without_leaking_the_detail(self):
+        """เดิมส่ง str(exc) กลับให้ผู้ใช้ ซึ่งพาของที่ไม่ควรออกไปด้วย
+
+        ตอน OPENAI_API_KEY ผิด OpenAI ตอบกลับพร้อมคีย์ที่มาสก์ไว้บางส่วน แล้วบอท
+        ก็โพสต์ลงแชต Telegram ให้ค้างอยู่ในประวัติถาวร
+        """
         bot.client = FakeClient(completions=FakeCompletions(error=RuntimeError("rate limited")))
-        result = await bot.translate_text("Hello", "th")
-        self.assertIn("rate limited", result)
+        with self.assertLogs("bot", level="ERROR"):
+            result = await bot.translate_text("Hello", "th")
+        self.assertNotIn("rate limited", result)
+        self.assertIn("แปลภาษาไม่สำเร็จ", result)
 
 
 class TestTranscribe(ClientCase):
@@ -114,9 +121,15 @@ class TestTranscribe(ClientCase):
         bot.client = None
         self.assertIn("not configured", await bot.transcribe_voice("/tmp/whatever.ogg"))
 
-    async def test_missing_file_is_reported_not_raised(self):
+    async def test_failures_propagate_so_the_caller_can_tell_them_apart(self):
+        """เดิมกลืน exception แล้วคืนข้อความ error เป็น "ผลการถอดเสียง"
+
+        ผลคือความล้มเหลวถูกบันทึกลงตาราง transcriptions เหมือนเป็นข้อความจริง
+        แล้วแสดงใต้หัวข้อ Voice Transcription ราวกับสำเร็จ
+        """
         bot.client = FakeClient()
-        self.assertIn("error", (await bot.transcribe_voice("/tmp/does-not-exist.ogg")).lower())
+        with self.assertRaises(OSError):
+            await bot.transcribe_voice("/tmp/does-not-exist.ogg")
 
 
 if __name__ == "__main__":

@@ -128,7 +128,9 @@ class TestVoiceTempFile(BotDbCase):
         created, replies = await self.run_voice(boom)
         self.assertEqual(len(created), 1)
         self.assertFalse(os.path.exists(created[0]), "ล้มเหลวแล้วไฟล์ยังต้องถูกลบ")
-        self.assertIn("Could not transcribe", replies[-1])
+        self.assertIn("ถอดเสียงไม่สำเร็จ", replies[-1])
+        self.assertNotIn("โควตาหมด", replies[-1],
+                         "ข้อความจาก exception ต้องไม่หลุดไปถึงผู้ใช้")
 
 
 class TestCancel(BotDbCase):
