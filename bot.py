@@ -23,6 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiohttp
 
 import line_webhook
+import line_export
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -1412,6 +1413,126 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# นำเข้าประวัติแชทจากไฟล์ export
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ไฟล์ export ของแชทที่คุยกันมานานเป็นปีก็ยังไม่กี่ MB ถ้าใหญ่กว่านี้มักไม่ใช่
+# ไฟล์ export แต่เป็นอย่างอื่นที่ส่งผิด
+MAX_EXPORT_BYTES = 8 * 1024 * 1024
+
+# "ฉันคือ สมชาย" / "ผมคือ Farid" / "me: Somchai" — ใช้บอกว่าชื่อไหนคือเจ้าของ
+_OWNER_HINT_RE = re.compile(
+    r"^\s*(?:ฉันคือ|ผมคือ|เราคือ|me)\s*[:：]?\s*(?P<name>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _owner_from_caption(caption: Optional[str]) -> Optional[str]:
+    if not caption:
+        return None
+    match = _OWNER_HINT_RE.match(caption)
+    return match.group("name") if match else None
+
+
+async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """รับไฟล์ .txt ที่ export จาก LINE แล้วนำเข้าตารางกลาง
+
+    ส่งไฟล์มาเฉย ๆ ก็พอ ถ้าเป็นแชทกลุ่มหรือบอทเดาชื่อเจ้าของไม่ได้ ให้ใส่ caption
+    ว่า "ฉันคือ <ชื่อที่คุณใช้ในแชทนั้น>" มาด้วย ไม่งั้นทุกข้อความจะถูกนับเป็น
+    ข้อความขาเข้า และตัวเลข "รอเราตอบ" จะผิด
+    """
+    document = update.message.document
+    if not document:
+        return
+
+    name = (document.file_name or "").lower()
+    if not name.endswith(".txt"):
+        await update.message.reply_text(
+            "📎 รับเฉพาะไฟล์ .txt ที่ export จาก LINE\n"
+            "ในแอป LINE: เปิดห้องแชท → เมนู → การตั้งค่า → บันทึกประวัติแชท"
+        )
+        return
+
+    if document.file_size and document.file_size > MAX_EXPORT_BYTES:
+        await update.message.reply_text(
+            f"📎 ไฟล์ใหญ่เกิน {MAX_EXPORT_BYTES // (1024 * 1024)} MB "
+            "ลองแบ่งเป็นช่วงเวลาสั้นลงแล้วส่งใหม่"
+        )
+        return
+
+    await update.message.reply_text("📥 กำลังอ่านไฟล์...")
+
+    import asyncio   # โมดูลนี้ import asyncio ในฟังก์ชันเป็นแบบแผนอยู่แล้ว
+
+    temp_path = None
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as handle:
+            temp_path = handle.name
+        await telegram_file.download_to_drive(temp_path)
+
+        # ไฟล์จาก LINE เป็น UTF-8 แต่บางเครื่องบันทึกมาพร้อม BOM
+        with open(temp_path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            raw_text = handle.read()
+
+        owner = _owner_from_caption(update.message.caption)
+        guessed = owner is None
+
+        # ทั้งการเปิดและปิด connection อยู่ในเธรดเดียวกันภายใน import_from_text
+        # ส่ง connection ข้ามเธรดเข้า to_thread ไม่ได้ — sqlite3 ผูกไว้กับเธรดที่สร้าง
+        export, result = await asyncio.to_thread(
+            line_export.import_from_text,
+            DB_PATH,
+            raw_text,
+            owner_name=owner,
+        )
+
+        if not export.messages:
+            await update.message.reply_text(
+                "❌ อ่านไฟล์แล้วไม่พบข้อความเลย\n"
+                f"บรรทัดที่อ่านไม่ออก: {len(export.skipped)}\n\n"
+                "ไฟล์อาจเป็นรูปแบบที่ยังไม่รองรับ ส่งไฟล์มาให้ดูได้"
+            )
+            return
+
+        if owner is None:
+            owner = line_export.guess_owner(export)
+
+        lines = [
+            f"📥 **นำเข้าแล้ว**\n",
+            f"ห้อง: {escape_md(result.title or 'ไม่ทราบชื่อ')}",
+            f"เก็บใหม่: {result.imported} ข้อความ",
+        ]
+        if result.duplicates:
+            lines.append(f"มีอยู่แล้ว (ข้าม): {result.duplicates}")
+        if result.skipped_lines:
+            lines.append(f"⚠️ อ่านไม่ออก: {result.skipped_lines} บรรทัด")
+        if result.intents:
+            summary = " · ".join(
+                f"{intent} {count}"
+                for intent, count in sorted(result.intents.items())
+            )
+            lines.append(f"\nคัดแยกได้: {summary}")
+
+        if owner is None:
+            lines.append(
+                "\n⚠️ ไม่รู้ว่าชื่อไหนคือคุณ จึงนับทุกข้อความเป็นขาเข้า\n"
+                "ส่งไฟล์ใหม่พร้อม caption ว่า `ฉันคือ <ชื่อของคุณในแชทนั้น>`\n"
+                f"ชื่อที่พบ: {escape_md(', '.join(export.senders[:5]))}"
+            )
+        elif guessed:
+            lines.append(f"\nเดาว่าคุณคือ {escape_md(owner)} — ถ้าผิดบอกได้")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(api_failure_message(e, "นำเข้าไฟล์แชท"))
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # VOICE MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1876,6 +1997,9 @@ def build_application() -> Application:
     
     # Voice handler
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # ไฟล์ประวัติแชทที่ export มา
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_chat_export))
     
     # Text handler (last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
