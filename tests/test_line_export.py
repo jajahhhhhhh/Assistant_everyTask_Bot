@@ -633,3 +633,9 @@ class TestRepeatedSpacesInTheLine(BotDbCase):
             )),
             ["Ann Lee", "Bob"],
         )
+
+    def test_learning_skips_whitespace_only_tails(self):
+        self.assertEqual(
+            line_export._learn_senders(["   ", "\t", "Ann hello", "Ann again"]),
+            ["Ann"],
+        )
