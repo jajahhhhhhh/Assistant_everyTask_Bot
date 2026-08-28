@@ -1421,17 +1421,28 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MAX_EXPORT_BYTES = 8 * 1024 * 1024
 
 # "ฉันคือ สมชาย" / "ผมคือ Farid" / "me: Somchai" — ใช้บอกว่าชื่อไหนคือเจ้าของ
+# หาคำใบ้ได้ทุกที่ในแคปชัน ไม่ใช่แค่ต้นข้อความ — เจ้าของพิมพ์
+# `/task - Renovate "ฉันคือ W.ch♾️💵💰 "` มาจริง ๆ แล้วรุ่นที่ยึดหัวข้อความไว้
+# อ่านไม่เจอ บอทจึงนับข้อความของเขาเองเป็นขาเข้าทั้ง 722 ใบ
+# "me" ยังยึดหัวบรรทัดอยู่ ไม่งั้น "send me the file" จะกลายเป็นชื่อคน
 _OWNER_HINT_RE = re.compile(
-    r"^\s*(?:ฉันคือ|ผมคือ|เราคือ|me)\s*[:：]?\s*(?P<name>.+?)\s*$",
-    re.IGNORECASE,
+    r"(?:ฉันคือ|ผมคือ|ดิฉันคือ|หนูคือ|เราคือ|^\s*me\b)\s*[:：]?\s*(?P<name>[^\n]+)",
+    re.IGNORECASE | re.MULTILINE,
 )
+
+# อัญประกาศที่ล้อมชื่อไว้ต้องถูกปอกทิ้ง ไม่งั้นได้ชื่อ '"W.ch♾️💵💰"' ซึ่งไม่ตรง
+# กับชื่อผู้ส่งในไฟล์ และจะเงียบ ๆ ไม่ตรงกับใครเลย
+_OWNER_QUOTES = " \t\"'`«»“”‘’"
 
 
 def _owner_from_caption(caption: Optional[str]) -> Optional[str]:
     if not caption:
         return None
-    match = _OWNER_HINT_RE.match(caption)
-    return match.group("name") if match else None
+    match = _OWNER_HINT_RE.search(caption)
+    if not match:
+        return None
+    name = match.group("name").strip().strip(_OWNER_QUOTES).strip()
+    return name or None
 
 
 async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1445,8 +1456,16 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not document:
         return
 
+    # log ทุกจังหวะที่ตัดสินใจ ไม่ใช่แค่ตอนพัง — การนำเข้าเจ็ดร้อยข้อความที่ไม่
+    # ทิ้งร่องรอยไว้ใน log เลย ทำให้แยกไม่ออกระหว่าง "สำเร็จ" กับ "ไฟล์ไม่เคยมาถึง"
+    logger.info(
+        "รับไฟล์แชท: %s (%s ไบต์) จากผู้ใช้ %s",
+        document.file_name, document.file_size, update.effective_user.id,
+    )
+
     name = (document.file_name or "").lower()
     if not name.endswith(".txt"):
+        logger.info("ปฏิเสธไฟล์แชท: นามสกุลไม่ใช่ .txt")
         await update.message.reply_text(
             "📎 รับเฉพาะไฟล์ .txt ที่ export จาก LINE\n"
             "ในแอป LINE: เปิดห้องแชท → เมนู → การตั้งค่า → บันทึกประวัติแชท"
@@ -1454,6 +1473,7 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if document.file_size and document.file_size > MAX_EXPORT_BYTES:
+        logger.info("ปฏิเสธไฟล์แชท: ใหญ่เกิน %s ไบต์", MAX_EXPORT_BYTES)
         await update.message.reply_text(
             f"📎 ไฟล์ใหญ่เกิน {MAX_EXPORT_BYTES // (1024 * 1024)} MB "
             "ลองแบ่งเป็นช่วงเวลาสั้นลงแล้วส่งใหม่"
@@ -1475,8 +1495,7 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
         with open(temp_path, "r", encoding="utf-8-sig", errors="replace") as handle:
             raw_text = handle.read()
 
-        owner = _owner_from_caption(update.message.caption)
-        guessed = owner is None
+        requested_owner = _owner_from_caption(update.message.caption)
 
         # ทั้งการเปิดและปิด connection อยู่ในเธรดเดียวกันภายใน import_from_text
         # ส่ง connection ข้ามเธรดเข้า to_thread ไม่ได้ — sqlite3 ผูกไว้กับเธรดที่สร้าง
@@ -1484,12 +1503,16 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             line_export.import_from_text,
             DB_PATH,
             raw_text,
-            owner_name=owner,
+            owner_name=requested_owner,
             # ไฟล์บางรุ่นไม่มีบรรทัดหัวเรื่อง ชื่อห้องเหลืออยู่แค่ในชื่อไฟล์
             file_name=document.file_name,
         )
 
         if not export.messages:
+            logger.warning(
+                "นำเข้าไฟล์แชทไม่สำเร็จ: อ่านไม่ออกทั้ง %s บรรทัด",
+                len(export.skipped),
+            )
             await update.message.reply_text(
                 "❌ อ่านไฟล์แล้วไม่พบข้อความเลย\n"
                 f"บรรทัดที่อ่านไม่ออก: {len(export.skipped)}\n\n"
@@ -1497,14 +1520,15 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        if owner is None:
-            owner = line_export.guess_owner(export)
+        owner, guessed = result.owner, result.owner_guessed
 
         lines = [
             f"📥 **นำเข้าแล้ว**\n",
             f"ห้อง: {escape_md(result.title or 'ไม่ทราบชื่อ')}",
             f"เก็บใหม่: {result.imported} ข้อความ",
         ]
+        if result.corrected:
+            lines.append(f"แก้ทิศทางของเดิม: {result.corrected}")
         if result.duplicates:
             lines.append(f"มีอยู่แล้ว (ข้าม): {result.duplicates}")
         if result.skipped_lines:
@@ -1516,14 +1540,33 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             lines.append(f"\nคัดแยกได้: {summary}")
 
-        if owner is None:
+        if result.owner_unmatched:
+            # บอกให้ชัดว่าพิมพ์ชื่อมาแล้ว แต่ไม่มีชื่อนี้ในไฟล์ — ต่างจากไม่ได้พิมพ์มา
+            lines.append(
+                f"\n⚠️ ไม่พบชื่อ {escape_md(result.owner_unmatched)} ในไฟล์นี้ "
+                "จึงนับทุกข้อความเป็นขาเข้า\n"
+                f"ชื่อที่มีจริง: {escape_md(', '.join(export.senders[:5]))}\n"
+                "ส่งไฟล์เดิมซ้ำพร้อมชื่อที่ถูก แล้วบอทจะแก้ทิศทางให้ ไม่เพิ่มซ้ำ"
+            )
+        elif owner is None:
             lines.append(
                 "\n⚠️ ไม่รู้ว่าชื่อไหนคือคุณ จึงนับทุกข้อความเป็นขาเข้า\n"
                 "ส่งไฟล์ใหม่พร้อม caption ว่า `ฉันคือ <ชื่อของคุณในแชทนั้น>`\n"
-                f"ชื่อที่พบ: {escape_md(', '.join(export.senders[:5]))}"
+                f"ชื่อที่พบ: {escape_md(', '.join(export.senders[:5]))}\n"
+                "ส่งซ้ำได้เลย บอทจะแก้ทิศทางของเดิม ไม่เพิ่มซ้ำ"
             )
         elif guessed:
             lines.append(f"\nเดาว่าคุณคือ {escape_md(owner)} — ถ้าผิดบอกได้")
+
+        # นับอย่างเดียว ไม่เอาเนื้อความหรือชื่อคนลง log — ประวัติแชตเป็นข้อมูลส่วนตัว
+        logger.info(
+            "นำเข้าไฟล์แชทสำเร็จ: อ่านได้ %s ข้อความ เก็บใหม่ %s แก้ทิศทาง %s ซ้ำ %s "
+            "อ่านไม่ออก %s บรรทัด ผู้ส่ง %s คน เจ้าของ: %s",
+            len(export.messages), result.imported, result.corrected,
+            result.duplicates, result.skipped_lines, len(export.senders),
+            "ระบุมาแต่ไม่มีในไฟล์" if result.owner_unmatched
+            else ("ไม่รู้" if owner is None else ("เดาเอง" if guessed else "ผู้ใช้ระบุมา")),
+        )
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
