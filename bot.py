@@ -1485,6 +1485,8 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             DB_PATH,
             raw_text,
             owner_name=owner,
+            # ไฟล์บางรุ่นไม่มีบรรทัดหัวเรื่อง ชื่อห้องเหลืออยู่แค่ในชื่อไฟล์
+            file_name=document.file_name,
         )
 
         if not export.messages:
