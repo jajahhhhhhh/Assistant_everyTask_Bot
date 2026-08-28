@@ -368,7 +368,7 @@ class TestSingleSpaceFormat(unittest.TestCase):
 
 class TestSingleSpaceEdges(unittest.TestCase):
     def test_a_system_line_with_no_sender_is_reported_not_invented(self):
-        """"12:14 ยกเลิกข้อความแล้ว" ซ้ำหลายครั้งโดยไม่มีเนื้อความต่อท้ายเลย
+        """'"12:14 ยกเลิกข้อความแล้ว"' ซ้ำหลายครั้งโดยไม่มีเนื้อความต่อท้ายเลย
 
         ความถี่อย่างเดียวจะเข้าใจว่ามันเป็นชื่อคน ต้องกันไว้ ไม่งั้นจะได้ผู้ส่ง
         ปลอมเพิ่มมาหนึ่งคนพร้อมข้อความว่างเปล่า
@@ -377,6 +377,15 @@ class TestSingleSpaceEdges(unittest.TestCase):
         export = line_export.parse_export(text)
         self.assertNotIn("ยกเลิกข้อความแล้ว", export.senders)
         self.assertEqual(len(export.skipped), 2)
+
+    def test_sender_learning_ignores_empty_tokens_from_repeated_spaces(self):
+        tails = [
+            "Ann  Lee hello",
+            "Ann  Lee again",
+            "Bob hi",
+            "Bob there",
+        ]
+        self.assertEqual(sorted(line_export._learn_senders(tails)), ["Ann Lee", "Bob"])
 
     def test_a_line_whose_sender_is_unknown_does_not_glue_onto_the_one_above(self):
         """ถ้าปล่อยให้ตกไปเป็น "บรรทัดต่อ" ข้อความจะไปแปะท้ายของคนอื่น"""
