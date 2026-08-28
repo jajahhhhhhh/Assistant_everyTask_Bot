@@ -321,3 +321,240 @@ class TestImportFromText(BotDbCase):
         )
         self.assertEqual(export.messages, [])
         self.assertEqual(result.imported, 0)
+
+
+# รูปแบบที่ไฟล์จริงเป็น: ไม่มีบรรทัดหัวเรื่อง วันที่ตามด้วยชื่อวันแบบไม่มีวงเล็บ
+# และคั่นเวลา/ชื่อ/เนื้อความด้วย "ช่องว่างเดียว" โดยที่ชื่อคนก็มีช่องว่างได้
+EXPORT_SINGLE_SPACE = """2026.07.09 วันพฤหัสบดี
+09:15 MR.HOME KOH SAMUI สวัสดีครับ
+09:16 Minnie🐹 รับทราบค่ะ
+09:17 MR.HOME KOH SAMUI ส่งของพรุ่งนี้นะครับ
+09:18 Minnie🐹 ขอบคุณค่ะ
+09:19 MR.HOME KOH SAMUI ครับผม
+"""
+
+
+class TestSingleSpaceFormat(unittest.TestCase):
+    """รูปแบบที่ไฟล์ export จริงจากเครื่องผู้ใช้เป็น
+
+    parser รุ่นแรกอ่านไฟล์นี้ไม่ออกเลยแม้แต่บรรทัดเดียว — 766 บรรทัดกลายเป็น
+    "อ่านไม่ออก" ทั้งหมด เพราะพลาดสามเรื่องพร้อมกัน: คั่นด้วยช่องว่างเดียว
+    ไม่ใช่ tab, ชื่อวันต่อท้ายวันที่ไม่มีวงเล็บครอบ, และไม่มีบรรทัดหัวเรื่อง
+    """
+
+    def setUp(self):
+        self.export = line_export.parse_export(EXPORT_SINGLE_SPACE)
+
+    def test_a_weekday_without_brackets_still_reads_as_a_date(self):
+        self.assertEqual(len(self.export.skipped), 0)
+
+    def test_every_message_is_read(self):
+        self.assertEqual(len(self.export.messages), 5)
+
+    def test_a_sender_name_containing_spaces_is_kept_whole(self):
+        """หัวใจของรูปแบบนี้ — ตัดตรงช่องว่างแรกจะได้ชื่อ "MR.HOME" ซึ่งผิด"""
+        self.assertIn("MR.HOME KOH SAMUI", self.export.senders)
+        self.assertEqual(len(self.export.senders), 2)
+
+    def test_the_body_does_not_keep_the_rest_of_the_name(self):
+        first = self.export.messages[0]
+        self.assertEqual(first.sender, "MR.HOME KOH SAMUI")
+        self.assertEqual(first.body, "สวัสดีครับ")
+
+    def test_a_one_word_name_does_not_swallow_the_first_word_of_the_body(self):
+        minnie = [m for m in self.export.messages if m.sender == "Minnie🐹"]
+        self.assertEqual([m.body for m in minnie], ["รับทราบค่ะ", "ขอบคุณค่ะ"])
+
+
+class TestSingleSpaceEdges(unittest.TestCase):
+    def test_a_system_line_with_no_sender_is_reported_not_invented(self):
+        """"12:14 ยกเลิกข้อความแล้ว" ซ้ำหลายครั้งโดยไม่มีเนื้อความต่อท้ายเลย
+
+        ความถี่อย่างเดียวจะเข้าใจว่ามันเป็นชื่อคน ต้องกันไว้ ไม่งั้นจะได้ผู้ส่ง
+        ปลอมเพิ่มมาหนึ่งคนพร้อมข้อความว่างเปล่า
+        """
+        text = EXPORT_SINGLE_SPACE + "12:14 ยกเลิกข้อความแล้ว\n21:42 ยกเลิกข้อความแล้ว\n"
+        export = line_export.parse_export(text)
+        self.assertNotIn("ยกเลิกข้อความแล้ว", export.senders)
+        self.assertEqual(len(export.skipped), 2)
+
+    def test_a_line_whose_sender_is_unknown_does_not_glue_onto_the_one_above(self):
+        """ถ้าปล่อยให้ตกไปเป็น "บรรทัดต่อ" ข้อความจะไปแปะท้ายของคนอื่น"""
+        text = EXPORT_SINGLE_SPACE + "12:14 ยกเลิกข้อความแล้ว\n"
+        export = line_export.parse_export(text)
+        self.assertNotIn("ยกเลิก", export.messages[-1].body)
+
+    def test_a_name_seen_only_once_is_reported_rather_than_guessed(self):
+        """ครั้งเดียวไม่มีอะไรให้เทียบความถี่ เดาแล้วตัดผิดแย่กว่ารายงานว่าอ่านไม่ออก"""
+        export = line_export.parse_export(
+            EXPORT_SINGLE_SPACE + "09:30 คนแปลกหน้า ทักมาครั้งเดียว\n"
+        )
+        self.assertNotIn("คนแปลกหน้า", export.senders)
+        self.assertEqual(len(export.skipped), 1)
+
+    def test_a_tab_file_is_untouched_by_the_guessing(self):
+        """รูปแบบ tab ตัดได้ชัดเจนอยู่แล้ว ห้ามให้ตัวเดาเข้าไปยุ่ง"""
+        export = line_export.parse_export(EXPORT_EN)
+        self.assertEqual(export.senders, ["Farid", "J"])
+        self.assertEqual(len(export.skipped), 0)
+
+    def test_a_longer_name_wins_over_a_shorter_one_that_prefixes_it(self):
+        """ไฟล์ผสมสองรูปแบบ — บรรทัด tab บอกชื่อเต็มให้บรรทัดช่องว่างเดียวใช้ได้
+
+        ถ้าลองชื่อสั้นก่อน "Ann Lee ครับ" จะถูกตัดเป็นชื่อ "Ann" แล้วเอา "Lee"
+        ไปนับเป็นคำแรกของเนื้อความ
+        """
+        text = (
+            "2026.07.09 วันพฤหัสบดี\n"
+            "09:15\tAnn Lee\tสวัสดี\n"
+            "09:16 Ann บาย\n09:17 Ann Lee ครับผม\n09:18 Ann โอเค\n"
+        )
+        export = line_export.parse_export(text)
+        self.assertEqual(sorted(export.senders), ["Ann", "Ann Lee"])
+        for message in export.messages:
+            self.assertNotIn("Lee", message.body)
+
+    def test_two_names_where_one_prefixes_the_other_need_a_tab_line_to_tell_apart(self):
+        """ข้อจำกัดที่รู้ตัว ไม่ใช่ช่องที่ลืมทดสอบ
+
+        ถ้าไฟล์คั่นด้วยช่องว่างเดียวล้วน ๆ ความถี่แยกไม่ออกว่า "Ann Lee ครับ"
+        คือคนชื่อ "Ann Lee" หรือคนชื่อ "Ann" ที่ขึ้นต้นข้อความว่า "Lee" — เลือก
+        ตัดสั้นไว้ก่อน เพราะเดายาวเกินแล้วกินเนื้อความหายเสียหายกว่า
+        """
+        text = (
+            "2026.07.09 วันพฤหัสบดี\n"
+            "09:15 Ann สวัสดี\n09:16 Ann Lee ครับ\n"
+            "09:17 Ann บาย\n09:18 Ann Lee ครับผม\n"
+        )
+        export = line_export.parse_export(text)
+        self.assertEqual(export.senders, ["Ann"])
+        self.assertEqual(len(export.messages), 4)   # ไม่มีบรรทัดไหนหายไป
+
+
+class TestTitleFallsBackToTheFileName(unittest.TestCase):
+    """ไฟล์จริงไม่มีบรรทัด "[LINE] Chat with ..." เลย ชื่อห้องเหลืออยู่แค่ชื่อไฟล์"""
+
+    def test_the_line_header_is_stripped_off_the_file_name(self):
+        self.assertEqual(
+            line_export.title_from_filename("[LINE] Chat with Farid.txt"), "Farid"
+        )
+
+    def test_a_thai_file_name_works_too(self):
+        self.assertEqual(
+            line_export.title_from_filename("[LINE] แชทใน บ้านสมุย.txt"), "บ้านสมุย"
+        )
+
+    def test_a_plain_file_name_is_used_as_is(self):
+        self.assertEqual(line_export.title_from_filename("บ้านสมุย.txt"), "บ้านสมุย")
+
+    def test_no_file_name_means_no_title(self):
+        self.assertIsNone(line_export.title_from_filename(None))
+        self.assertIsNone(line_export.title_from_filename("  "))
+
+    def test_the_fallback_is_only_used_when_the_file_has_no_header(self):
+        export = line_export.parse_export(EXPORT_EN, fallback_title="ผิด")
+        self.assertEqual(export.title, "Farid")
+
+    def test_the_fallback_fills_in_when_the_file_has_no_header(self):
+        export = line_export.parse_export(
+            EXPORT_SINGLE_SPACE, fallback_title="บ้านสมุย"
+        )
+        self.assertEqual(export.title, "บ้านสมุย")
+
+
+class TestRepeatedMessagesSurvive(BotDbCase):
+    """ข้อความที่เหมือนกันเป๊ะในนาทีเดียวกันต้องเข้าครบทุกใบ
+
+    ไฟล์ export บอกเวลาละเอียดแค่ระดับนาที คนส่งรูปสามรูปรวดจะได้
+    (direction, sent_at, body) เหมือนกันทั้งสามใบ ตัวกันซ้ำรุ่นแรกใช้ set จึงเก็บ
+    ใบเดียวแล้วนับอีกสองใบเป็น "ซ้ำ" — ไฟล์จริงไฟล์แรกที่เอามาทดสอบหายไป 76 จาก
+    722 ข้อความด้วยอาการนี้ โดยที่ข้อความตอบกลับดูเหมือนสำเร็จทุกประการ
+    """
+
+    SAME_MINUTE = (
+        "[LINE] Chat with A\n2026/08/24\n"
+        "09:15\tA\tรูป\n09:15\tA\tรูป\n09:15\tA\tรูป\n"
+    )
+
+    def _import(self, conn, text=None):
+        return line_export.import_export(
+            conn, line_export.parse_export(text or self.SAME_MINUTE)
+        )
+
+    def test_all_three_copies_are_kept(self):
+        conn = bot.connect(bot.DB_PATH)
+        try:
+            result = self._import(conn)
+            self.assertEqual(result.imported, 3)
+            self.assertEqual(result.duplicates, 0)
+            count, = conn.execute(
+                "SELECT COUNT(*) FROM chat_messages WHERE body = 'รูป'"
+            ).fetchone()
+            self.assertEqual(count, 3)
+        finally:
+            conn.close()
+
+    def test_importing_the_same_file_again_still_adds_nothing(self):
+        """กันซ้ำต้องไม่พังไปพร้อมกับการแก้ — นำเข้าไฟล์เดิมซ้ำยังต้องได้ศูนย์แถว"""
+        conn = bot.connect(bot.DB_PATH)
+        try:
+            self._import(conn)
+            again = self._import(conn)
+            self.assertEqual(again.imported, 0)
+            self.assertEqual(again.duplicates, 3)
+            count, = conn.execute("SELECT COUNT(*) FROM chat_messages").fetchone()
+            self.assertEqual(count, 3)
+        finally:
+            conn.close()
+
+    def test_a_second_import_of_a_longer_file_only_adds_the_new_lines(self):
+        conn = bot.connect(bot.DB_PATH)
+        try:
+            self._import(conn, "[LINE] Chat with A\n2026/08/24\n09:15\tA\tรูป\n")
+            longer = self._import(conn)
+            self.assertEqual((longer.imported, longer.duplicates), (2, 1))
+        finally:
+            conn.close()
+
+
+class TestReExportingTheSameChat(BotDbCase):
+    """export ห้องเดิมอีกรอบตอนมีข้อความใหม่ ต้องต่อท้ายห้องเดิม ไม่ใช่สร้างห้องใหม่
+
+    คีย์ห้องรุ่นแรกผสม "เวลาข้อความแรก" กับ "จำนวนข้อความ" เข้าไปด้วย ไฟล์ที่ยาว
+    ขึ้นจึงได้คีย์ใหม่ ผลคือได้ห้องซ้ำสองห้องและประวัติเก่าทั้งกองถูกนำเข้าซ้ำ
+    """
+
+    FIRST = "[LINE] Chat with A\n2026/08/24\n09:15\tA\tหนึ่ง\n09:16\tA\tสอง\n"
+    LATER = FIRST + "2026/08/25\n10:00\tA\tสาม\n"
+
+    def _import(self, text):
+        conn = bot.connect(bot.DB_PATH)
+        try:
+            return line_export.import_export(conn, line_export.parse_export(text))
+        finally:
+            conn.close()
+
+    def test_a_longer_export_of_the_same_chat_keeps_the_same_thread(self):
+        first = self._import(self.FIRST)
+        later = self._import(self.LATER)
+        self.assertEqual(first.thread_id, later.thread_id)
+
+    def test_only_the_new_messages_are_added(self):
+        self._import(self.FIRST)
+        later = self._import(self.LATER)
+        self.assertEqual((later.imported, later.duplicates), (1, 2))
+
+    def test_there_is_still_only_one_thread(self):
+        self._import(self.FIRST)
+        self._import(self.LATER)
+        rows = self.rows("SELECT COUNT(*) AS n FROM chat_threads")
+        self.assertEqual(rows[0]["n"], 1)
+
+    def test_a_file_with_no_title_keys_off_the_people_in_it(self):
+        """ไฟล์จริงไม่มีบรรทัดหัวเรื่อง ถ้าไม่มีชื่อไฟล์มาด้วยก็ยังต้องจับคู่ห้องถูก"""
+        short = "2026.07.09 วันพฤหัสบดี\n09:15 Ann สวัสดี\n09:16 Ann บาย\n"
+        longer = short + "09:17 Ann โอเค\n"
+        self.assertEqual(
+            line_export.thread_key(line_export.parse_export(short)),
+            line_export.thread_key(line_export.parse_export(longer)),
+        )
