@@ -184,7 +184,9 @@ def _learn_senders(tails: List[str]) -> List[str]:
     counts: Dict[str, int] = {}
     children: Dict[str, set] = {}
     for tail in tails:
-        tokens = tail.split(" ")
+        # split() ไม่ใช่ split(" ") — ช่องว่างสองตัวติดกันทำให้ split(" ") คืน token
+        # ว่างออกมา แล้ว token ว่างนั้นถูกต่อเป็นชื่อ ได้ชื่อที่ลงท้ายด้วยช่องว่าง
+        tokens = tail.split()
         for size in range(1, min(len(tokens), _MAX_SENDER_TOKENS) + 1):
             prefix = " ".join(tokens[:size])
             if len(prefix) > _MAX_SENDER_CHARS:
@@ -194,7 +196,7 @@ def _learn_senders(tails: List[str]) -> List[str]:
                 children.setdefault(prefix, set()).add(tokens[size])
 
     learned = []
-    for head in {tail.split(" ")[0] for tail in tails}:
+    for head in {tail.split()[0] for tail in tails if tail.split()}:
         if counts.get(head, 0) < 2:
             continue
         name = head
@@ -205,7 +207,7 @@ def _learn_senders(tails: List[str]) -> List[str]:
             candidate = f"{name} {next(iter(following))}"
             if counts.get(candidate) != counts[name]:
                 break
-            if len(candidate.split(" ")) > _MAX_SENDER_TOKENS:
+            if len(candidate.split()) > _MAX_SENDER_TOKENS:
                 break
             if len(candidate) > _MAX_SENDER_CHARS:
                 break
@@ -218,6 +220,16 @@ def _learn_senders(tails: List[str]) -> List[str]:
     return learned
 
 
+def _sender_pattern(name: str) -> "re.Pattern":
+    """regex ของชื่อหนึ่งชื่อ ที่ยอมให้ช่องว่างระหว่างคำเป็นกี่ตัวก็ได้
+
+    ชื่อที่เรียนมาถูกประกอบใหม่ด้วยช่องว่างเดียวเสมอ แต่บรรทัดดิบอาจมีสองตัว
+    เทียบด้วย startswith ตรง ๆ จะไม่ match แล้วบรรทัดนั้นกลายเป็นอ่านไม่ออก
+    """
+    spaced = r"[ \t]+".join(re.escape(token) for token in name.split())
+    return re.compile(rf"{spaced}(?:[ \t]+(?P<body>.*))?$")
+
+
 def _split_by_sender(tail: str, senders: List[str]) -> Optional[Tuple[str, str]]:
     """ตัดชื่อผู้ส่งออกจากหัวบรรทัด ลองชื่อยาวก่อนเสมอ
 
@@ -225,10 +237,9 @@ def _split_by_sender(tail: str, senders: List[str]) -> Optional[Tuple[str, str]]
     จะตัดผิดและเอาส่วนที่เหลือของชื่อไปนับเป็นเนื้อความ
     """
     for name in senders:
-        if tail == name:
-            return name, ""
-        if tail.startswith(f"{name} "):
-            return name, tail[len(name) + 1:]
+        match = _sender_pattern(name).match(tail)
+        if match:
+            return name, (match.group("body") or "")
     return None
 
 
