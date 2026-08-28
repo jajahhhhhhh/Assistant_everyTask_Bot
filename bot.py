@@ -1445,8 +1445,16 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not document:
         return
 
+    # log ทุกจังหวะที่ตัดสินใจ ไม่ใช่แค่ตอนพัง — การนำเข้าเจ็ดร้อยข้อความที่ไม่
+    # ทิ้งร่องรอยไว้ใน log เลย ทำให้แยกไม่ออกระหว่าง "สำเร็จ" กับ "ไฟล์ไม่เคยมาถึง"
+    logger.info(
+        "รับไฟล์แชท: %s (%s ไบต์) จากผู้ใช้ %s",
+        document.file_name, document.file_size, update.effective_user.id,
+    )
+
     name = (document.file_name or "").lower()
     if not name.endswith(".txt"):
+        logger.info("ปฏิเสธไฟล์แชท: นามสกุลไม่ใช่ .txt")
         await update.message.reply_text(
             "📎 รับเฉพาะไฟล์ .txt ที่ export จาก LINE\n"
             "ในแอป LINE: เปิดห้องแชท → เมนู → การตั้งค่า → บันทึกประวัติแชท"
@@ -1454,6 +1462,7 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if document.file_size and document.file_size > MAX_EXPORT_BYTES:
+        logger.info("ปฏิเสธไฟล์แชท: ใหญ่เกิน %s ไบต์", MAX_EXPORT_BYTES)
         await update.message.reply_text(
             f"📎 ไฟล์ใหญ่เกิน {MAX_EXPORT_BYTES // (1024 * 1024)} MB "
             "ลองแบ่งเป็นช่วงเวลาสั้นลงแล้วส่งใหม่"
@@ -1490,6 +1499,10 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
         if not export.messages:
+            logger.warning(
+                "นำเข้าไฟล์แชทไม่สำเร็จ: อ่านไม่ออกทั้ง %s บรรทัด",
+                len(export.skipped),
+            )
             await update.message.reply_text(
                 "❌ อ่านไฟล์แล้วไม่พบข้อความเลย\n"
                 f"บรรทัดที่อ่านไม่ออก: {len(export.skipped)}\n\n"
@@ -1524,6 +1537,15 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         elif guessed:
             lines.append(f"\nเดาว่าคุณคือ {escape_md(owner)} — ถ้าผิดบอกได้")
+
+        # นับอย่างเดียว ไม่เอาเนื้อความหรือชื่อคนลง log — ประวัติแชตเป็นข้อมูลส่วนตัว
+        logger.info(
+            "นำเข้าไฟล์แชทสำเร็จ: อ่านได้ %s ข้อความ เก็บใหม่ %s ซ้ำ %s "
+            "อ่านไม่ออก %s บรรทัด ผู้ส่ง %s คน เจ้าของ: %s",
+            len(export.messages), result.imported, result.duplicates,
+            result.skipped_lines, len(export.senders),
+            "ไม่รู้" if owner is None else ("เดาเอง" if guessed else "ผู้ใช้ระบุมา"),
+        )
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 

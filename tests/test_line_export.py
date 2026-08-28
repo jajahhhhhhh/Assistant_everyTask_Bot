@@ -567,3 +567,65 @@ class TestReExportingTheSameChat(BotDbCase):
             line_export.thread_key(line_export.parse_export(short)),
             line_export.thread_key(line_export.parse_export(longer)),
         )
+
+
+class TestRepeatedSpacesInTheLine(BotDbCase):
+    """ช่องว่างสองตัวติดกันเคยทำให้ชื่อผู้ส่งมีช่องว่างห้อยท้าย
+
+    tail.split(" ") คืน token ว่างเมื่อเจอช่องว่างซ้อน แล้ว token ว่างนั้นถูกต่อ
+    เป็นส่วนหนึ่งของชื่อ ได้ 'Ann Lee ' แทน 'Ann Lee'
+
+    ที่ทำให้เรื่องนี้ร้ายกว่าความสวยงามของชื่อ คือ owner_name เทียบด้วย == ตรง ๆ
+    ผู้ใช้พิมพ์ caption ว่า "ฉันคือ Ann Lee" แล้วไม่ match 'Ann Lee ' ผลคือข้อความ
+    ของตัวเองถูกบันทึกเป็นขาเข้าทั้งหมด และตัวเลข "รอเราตอบ" ผิดโดยไม่มีอะไรเตือน
+    """
+
+    TEXT = (
+        "2026.10.17 วันพฤหัสบดี\n"
+        "10:37 Ann Lee  สวัสดีค่ะ\n10:38 Ann Lee  ทดสอบอีกครั้ง\n"
+        "10:39 Bob  ขอบคุณครับ\n10:40 Bob  รับทราบ\n"
+    )
+
+    def test_no_learned_name_carries_stray_whitespace(self):
+        export = line_export.parse_export(self.TEXT)
+        for name in export.senders:
+            self.assertEqual(name, name.strip(), f"ชื่อ {name!r} มีช่องว่างติดมา")
+
+    def test_the_names_come_out_exactly_as_written(self):
+        export = line_export.parse_export(self.TEXT)
+        self.assertEqual(sorted(export.senders), ["Ann Lee", "Bob"])
+
+    def test_the_body_does_not_keep_the_extra_space(self):
+        export = line_export.parse_export(self.TEXT)
+        self.assertEqual(export.messages[0].body, "สวัสดีค่ะ")
+
+    def test_the_caption_the_user_would_type_actually_matches(self):
+        """ผลกระทบจริงของบั๊ก ไม่ใช่แค่ชื่อไม่สวย"""
+        _, result = line_export.import_from_text(
+            bot.DB_PATH, self.TEXT, owner_name="Ann Lee"
+        )
+        directions = [
+            row["direction"]
+            for row in self.rows("SELECT direction FROM chat_messages ORDER BY sent_at")
+        ]
+        self.assertEqual(directions, ["out", "out", "in", "in"])
+
+    def test_a_name_written_with_two_spaces_inside_it_still_matches(self):
+        """ชื่อที่เรียนมาถูกประกอบด้วยช่องว่างเดียว บรรทัดดิบอาจมีสองตัว"""
+        text = (
+            "2026.10.17 วันพฤหัสบดี\n"
+            "10:37 Ann  Lee สวัสดีค่ะ\n10:38 Ann  Lee ทดสอบ\n"
+            "10:39 Bob ขอบคุณครับ\n10:40 Bob รับทราบ\n"
+        )
+        export = line_export.parse_export(text)
+        self.assertIn("Ann Lee", export.senders)
+        self.assertEqual(len(export.skipped), 0)
+        self.assertEqual(export.messages[0].body, "สวัสดีค่ะ")
+
+    def test_learning_ignores_empty_tokens_from_repeated_spaces(self):
+        self.assertEqual(
+            sorted(line_export._learn_senders(
+                ["Ann  Lee hello", "Ann  Lee again", "Bob hi", "Bob there"]
+            )),
+            ["Ann Lee", "Bob"],
+        )
