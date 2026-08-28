@@ -22,7 +22,7 @@ import json
 import re
 import sqlite3
 import unicodedata
-from collections import Counter
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -388,6 +388,24 @@ def guess_owner(export: ParsedExport) -> Optional[str]:
     return others[0] if len(others) == 1 else None
 
 
+def resolve_owner(name: Optional[str], senders: List[str]) -> Optional[str]:
+    """จับชื่อที่ผู้ใช้พิมพ์เข้ากับชื่อผู้ส่งที่มีอยู่จริงในไฟล์
+
+    ทิศทางเทียบด้วย == ตรง ๆ ชื่อที่พิมพ์มาคลาดนิดเดียว (ช่องว่างเกิน ตัวพิมพ์
+    ใหญ่เล็ก) จึงกลายเป็นไม่ตรงกับใครเลยแบบเงียบ ๆ คืน None เมื่อจับไม่ได้ เพื่อ
+    ให้ผู้เรียกบอกผู้ใช้ว่าชื่อนี้ไม่มีในไฟล์ แทนที่จะนำเข้าผิดโดยไม่มีใครรู้
+    """
+    if not name:
+        return None
+    if name in senders:
+        return name
+    folded = " ".join(name.split()).casefold()
+    for sender in senders:
+        if " ".join(sender.split()).casefold() == folded:
+            return sender
+    return None
+
+
 def thread_key(export: ParsedExport) -> str:
     """id ของห้องแชทที่นำเข้า — คงที่สำหรับ "ห้องเดิม" และไม่ชนกับห้องจาก webhook
 
@@ -406,19 +424,51 @@ def thread_key(export: ParsedExport) -> str:
     return f"import:{digest}"
 
 
-def _existing_keys(conn: sqlite3.Connection, thread_id: int) -> Counter:
-    """นับข้อความที่มีอยู่แล้วในห้องนี้ ใช้กันการนำเข้าซ้ำ
+def _existing_rows(
+    conn: sqlite3.Connection, thread_id: int
+) -> Dict[Tuple[str, str], deque]:
+    """ข้อความที่มีอยู่แล้วในห้องนี้ จัดกลุ่มตาม (เวลา, เนื้อความ)
 
-    ต้อง "นับ" ไม่ใช่แค่ "มีหรือไม่มี" เพราะไฟล์ export บอกเวลาละเอียดแค่ระดับนาที
-    คนคนเดียวส่งรูปสามรูปในนาทีเดียวจะได้คีย์เหมือนกันเป๊ะทั้งสามข้อความ ถ้าใช้ set
-    จะเหลือรูปเดียว อีกสองรูปหายไปเงียบ ๆ โดยถูกนับเป็น "ซ้ำ" (ไฟล์จริงไฟล์แรก
-    ที่เอามาทดสอบ หายไป 76 จาก 722 ข้อความด้วยเหตุนี้)
+    คีย์ต้อง **ไม่มีทิศทาง** อยู่ในนั้น ไม่งั้นไฟล์เดิมที่ส่งซ้ำพร้อมชื่อเจ้าของ
+    ที่ถูกต้อง จะมองข้อความของเราเองเป็นของใหม่ทั้งหมด แล้วเพิ่มซ้ำเข้าไปอีกชุด
+    (ไฟล์จริงของเจ้าของ: ส่งซ้ำหนึ่งครั้งได้ 974 แถวจาก 722 ข้อความ) — ซึ่งเป็น
+    สิ่งที่ข้อความตอบของบอทบอกให้ผู้ใช้ทำเองด้วย
+
+    เก็บเป็นคิวต่อคีย์เพราะเวลาในไฟล์ export ละเอียดแค่ระดับนาที ข้อความที่
+    เหมือนกันเป๊ะในนาทีเดียวกันมีได้หลายใบ และต้องจับคู่ทีละใบ
     """
+    grouped: Dict[Tuple[str, str], deque] = {}
     rows = conn.execute(
-        "SELECT direction, sent_at, body FROM chat_messages WHERE thread_id = ?",
+        "SELECT id, direction, sent_at, body FROM chat_messages WHERE thread_id = ?"
+        " ORDER BY id",
         (thread_id,),
     )
-    return Counter((row["direction"], row["sent_at"], row["body"]) for row in rows)
+    for row in rows:
+        key = (row["sent_at"], row["body"])
+        grouped.setdefault(key, deque()).append((int(row["id"]), row["direction"]))
+    return grouped
+
+
+def _repoint_message(
+    conn: sqlite3.Connection,
+    message_id: int,
+    direction: str,
+    contact_id: Optional[int],
+) -> None:
+    """แก้ทิศทางของข้อความที่นำเข้าไปแล้ว
+
+    ล้าง intent/urgency/confidence ทิ้งด้วยเสมอ ข้อความที่กลายเป็นของเราเองไม่ใช่
+    สิ่งที่รอเราตอบ ส่วนข้อความที่กลายเป็นขาเข้าจะถูกคัดแยกใหม่โดยผู้เรียก
+    """
+    conn.execute(
+        """
+        UPDATE chat_messages
+           SET direction = ?, contact_id = ?,
+               intent = NULL, urgency = NULL, confidence = NULL
+         WHERE id = ?
+        """,
+        (direction, contact_id, message_id),
+    )
 
 
 def _upsert_import_contact(
@@ -442,7 +492,11 @@ class ImportResult:
     title: Optional[str]
     imported: int = 0
     duplicates: int = 0
+    corrected: int = 0          # แถวเดิมที่ถูกแก้ทิศทาง ไม่ใช่แถวใหม่
     skipped_lines: int = 0
+    owner: Optional[str] = None         # ชื่อที่ใช้จริง หลังจับคู่กับผู้ส่งในไฟล์
+    owner_guessed: bool = False
+    owner_unmatched: Optional[str] = None   # ผู้ใช้พิมพ์ชื่อมา แต่ไม่มีในไฟล์
     intents: Dict[str, int] = field(default_factory=dict)
 
 
@@ -475,29 +529,44 @@ def import_export(
             title=export.title,
         )
         result.thread_id = int(thread["id"])
-        seen = _existing_keys(conn, result.thread_id)
+        existing = _existing_rows(conn, result.thread_id)
         contacts: Dict[str, Optional[int]] = {}
+
+        def contact_for(sender: str) -> Optional[int]:
+            if sender not in contacts:
+                contacts[sender] = _upsert_import_contact(conn, sender)
+            return contacts[sender]
 
         for message in export.messages:
             is_owner = owner_name is not None and message.sender == owner_name
             direction = "out" if is_owner else "in"
-            # หักออกจากจำนวนที่มีอยู่ก่อนทีละใบ ข้อความที่เกินจำนวนเดิมคือของใหม่
-            # ผลคือ นำเข้าไฟล์เดิมซ้ำได้ศูนย์แถวเหมือนเดิม แต่ข้อความที่ซ้ำกันเอง
-            # "ภายในไฟล์" ยังเข้าครบทุกใบ
-            key = (direction, message.sent_at, message.body)
-            if seen[key] > 0:
-                seen[key] -= 1
-                result.duplicates += 1
-                continue
+            # ข้อความของเราเอง contact_id เป็น NULL
+            contact_id = None if is_owner else contact_for(message.sender)
 
-            if is_owner:
-                contact_id = None       # ข้อความของเราเอง contact_id เป็น NULL
-            else:
-                if message.sender not in contacts:
-                    contacts[message.sender] = _upsert_import_contact(
-                        conn, message.sender
-                    )
-                contact_id = contacts[message.sender]
+            # จับคู่กับแถวเดิมทีละใบจากคิว ที่เกินจำนวนเดิมคือของใหม่ ผลคือนำเข้า
+            # ไฟล์เดิมซ้ำได้ศูนย์แถวเหมือนเดิม แต่ข้อความที่ซ้ำกันเอง "ภายในไฟล์"
+            # ยังเข้าครบทุกใบ
+            waiting = existing.get((message.sent_at, message.body))
+            if waiting:
+                message_id, previous = waiting.popleft()
+                # รู้ชื่อเจ้าของแล้วเมื่อไร ทิศทางที่คำนวณได้ถือว่าถูกกว่าของเดิม
+                # นี่คือทางแก้ของไฟล์ที่นำเข้าไปแล้วโดยยังไม่รู้ว่าใครคือเจ้าของ:
+                # ส่งไฟล์เดิมซ้ำพร้อม caption ที่ถูก แล้วแถวเดิมจะถูกแก้ ไม่ใช่
+                # เพิ่มเข้าไปอีกชุด
+                if owner_name is not None and previous != direction:
+                    _repoint_message(conn, message_id, direction, contact_id)
+                    result.corrected += 1
+                    if direction == "in":
+                        classification = line_webhook.classify_message(message.body)
+                        line_webhook.apply_classification(
+                            conn, message_id, classification
+                        )
+                        intent = classification.get("intent")
+                        if intent:
+                            result.intents[intent] = result.intents.get(intent, 0) + 1
+                else:
+                    result.duplicates += 1
+                continue
 
             cursor = conn.execute(
                 """
@@ -555,7 +624,14 @@ def import_from_text(
         return export, ImportResult(thread_id=0, title=export.title,
                                     skipped_lines=len(export.skipped))
 
-    owner = owner_name if owner_name is not None else guess_owner(export)
+    # ชื่อที่ผู้ใช้พิมพ์มาต้องจับให้ตรงกับผู้ส่งจริงในไฟล์ก่อน ไม่งั้นการเทียบ
+    # ทิศทางด้วย == จะไม่ตรงกับใครเลยแบบเงียบ ๆ
+    owner = resolve_owner(owner_name, export.senders) if owner_name else None
+    guessed = False
+    if owner is None and owner_name is None:
+        owner = guess_owner(export)
+        guessed = owner is not None
+
     conn = line_webhook.connect(db_path)
     try:
         result = import_export(
@@ -566,4 +642,7 @@ def import_from_text(
         )
     finally:
         conn.close()
+    result.owner = owner
+    result.owner_guessed = guessed
+    result.owner_unmatched = owner_name if (owner_name and owner is None) else None
     return export, result
