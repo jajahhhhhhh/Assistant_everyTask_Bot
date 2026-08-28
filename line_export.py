@@ -184,8 +184,6 @@ def _learn_senders(tails: List[str]) -> List[str]:
     counts: Dict[str, int] = {}
     children: Dict[str, set] = {}
     for tail in tails:
-        # split() ไม่ใช่ split(" ") — ช่องว่างสองตัวติดกันทำให้ split(" ") คืน token
-        # ว่างออกมา แล้ว token ว่างนั้นถูกต่อเป็นชื่อ ได้ชื่อที่ลงท้ายด้วยช่องว่าง
         tokens = tail.split()
         for size in range(1, min(len(tokens), _MAX_SENDER_TOKENS) + 1):
             prefix = " ".join(tokens[:size])
@@ -196,7 +194,7 @@ def _learn_senders(tails: List[str]) -> List[str]:
                 children.setdefault(prefix, set()).add(tokens[size])
 
     learned = []
-    for head in {tail.split()[0] for tail in tails if tail.split()}:
+    for head in {tokens[0] for tail in tails if (tokens := tail.split())}:
         if counts.get(head, 0) < 2:
             continue
         name = head
