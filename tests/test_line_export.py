@@ -368,7 +368,7 @@ class TestSingleSpaceFormat(unittest.TestCase):
 
 class TestSingleSpaceEdges(unittest.TestCase):
     def test_a_system_line_with_no_sender_is_reported_not_invented(self):
-        """"12:14 ยกเลิกข้อความแล้ว" ซ้ำหลายครั้งโดยไม่มีเนื้อความต่อท้ายเลย
+        """`12:14 ยกเลิกข้อความแล้ว` ซ้ำหลายครั้งโดยไม่มีเนื้อความต่อท้ายเลย
 
         ความถี่อย่างเดียวจะเข้าใจว่ามันเป็นชื่อคน ต้องกันไว้ ไม่งั้นจะได้ผู้ส่ง
         ปลอมเพิ่มมาหนึ่งคนพร้อมข้อความว่างเปล่า
