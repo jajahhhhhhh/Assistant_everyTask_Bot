@@ -183,8 +183,8 @@ def _learn_senders(tails: List[str]) -> List[str]:
     """
     counts: Dict[str, int] = {}
     children: Dict[str, set] = {}
-    for tail in tails:
-        tokens = tail.split()
+    all_tokens = [tail.split() for tail in tails]
+    for tokens in all_tokens:
         for size in range(1, min(len(tokens), _MAX_SENDER_TOKENS) + 1):
             prefix = " ".join(tokens[:size])
             if len(prefix) > _MAX_SENDER_CHARS:
@@ -194,7 +194,7 @@ def _learn_senders(tails: List[str]) -> List[str]:
                 children.setdefault(prefix, set()).add(tokens[size])
 
     learned = []
-    for head in {tokens[0] for tail in tails if (tokens := tail.split())}:
+    for head in {tokens[0] for tokens in all_tokens if tokens}:
         if counts.get(head, 0) < 2:
             continue
         name = head
