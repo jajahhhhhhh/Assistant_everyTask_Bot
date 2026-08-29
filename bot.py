@@ -1478,13 +1478,13 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             return
 
+        _rooms_usage = (
+            "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
+            "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
+            "ดูเลขห้องด้วย `/rooms`"
+        )
         if len(context.args) < 2 or not context.args[0].isdigit():
-            await update.message.reply_text(
-                "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
-                "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
-                "ดูเลขห้องด้วย `/rooms`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(_rooms_usage, parse_mode="Markdown")
             return
 
         thread_id = int(context.args[0])
@@ -1494,12 +1494,7 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name_parts, trailing = _split_off_commands(context.args[1:])
         project_name = " ".join(name_parts).strip()
         if not project_name:
-            await update.message.reply_text(
-                "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
-                "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
-                "ดูเลขห้องด้วย `/rooms`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(_rooms_usage, parse_mode="Markdown")
             return
         room = conn.execute(
             "SELECT id, title FROM chat_threads WHERE id = ?", (thread_id,)
