@@ -140,6 +140,55 @@ class TestRooms(BotDbCase):
         replies = await self.run_command("ลิปะน้อย", "1")
         self.assertIn("/rooms", replies[0])
 
+class TestRoomsTrailingCommand(BotDbCase):
+    """คำสั่งที่พิมพ์ต่อท้ายชื่อไซต์ในบรรทัดเดียวกัน
+
+    ผู้ใช้พิมพ์ "/rooms 2 Renovate เฉวง /reclassify" มาจริง Telegram ส่งมาเป็น
+    ข้อความเดียว จึงทำงานได้แค่คำสั่งแรก ถ้าเอาทุกคำมาต่อเป็นชื่อ ไซต์จะชื่อ
+    "Renovate เฉวง /reclassify" และ /reclassify ก็ไม่ได้รันด้วย เสียทั้งสองทาง
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        line_export.import_from_text(
+            bot.DB_PATH, EXPORT, owner_name="Ann Lee", file_name="งานลิปะน้อย.txt"
+        )
+
+    async def run_command(self, *args):
+        update = FakeUpdate()
+        await bot.rooms_command(update, FakeContext(*args))
+        return update.message.replies
+
+    def room_id(self):
+        return self.rows("SELECT id FROM chat_threads")[0]["id"]
+
+    async def test_the_command_does_not_become_part_of_the_site_name(self):
+        await self.run_command(str(self.room_id()), "เฉวง", "/reclassify")
+        names = [r["name"] for r in self.rows("SELECT name FROM projects")]
+        self.assertIn("เฉวง", names)
+        self.assertNotIn("เฉวง /reclassify", names)
+
+    async def test_the_dropped_command_is_reported(self):
+        replies = await self.run_command(str(self.room_id()), "เฉวง", "/reclassify")
+        self.assertIn("/reclassify", replies[-1])
+        self.assertIn("ไม่ได้ทำงาน", replies[-1])
+
+    async def test_a_plain_site_name_gets_no_warning(self):
+        replies = await self.run_command(str(self.room_id()), "เฉวง")
+        self.assertNotIn("ไม่ได้ทำงาน", replies[-1])
+
+    async def test_a_site_name_of_several_words_still_joins(self):
+        await self.run_command(str(self.room_id()), "ลิปะ", "น้อย", "/reclassify")
+        names = [r["name"] for r in self.rows("SELECT name FROM projects")]
+        self.assertIn("ลิปะ น้อย", names)
+
+    async def test_a_command_where_the_name_should_be_is_a_usage_error(self):
+        """เหลือแต่คำสั่ง = ไม่ได้บอกชื่อไซต์มา ต้องไม่ผูกกับชื่อว่าง"""
+        replies = await self.run_command(str(self.room_id()), "/reclassify")
+        self.assertIn("ใช้แบบนี้", replies[-1])
+        self.assertEqual(self.rows("SELECT name FROM projects"), [])
+
+
 class TestRoomsHint(BotDbCase):
     """คำใบ้ท้ายรายการต้องก๊อปไปใช้ได้เลย
 
