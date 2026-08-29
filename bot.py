@@ -1370,6 +1370,266 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHAT ROOMS ↔ PROJECTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# projects.type มี CHECK อยู่ห้าค่า งานที่ไม่เข้าพวกไหนเลยลงเป็น personal
+DEFAULT_PROJECT_TYPE = "personal"
+
+
+def _list_rooms(conn) -> list:
+    """ห้องแชตทั้งหมดพร้อมจำนวนข้อความและไซต์ที่ผูกไว้
+
+    เรียงตามข้อความล่าสุดก่อน ห้องที่คุยกันอยู่จึงอยู่บนสุดเสมอ
+    """
+    rows = conn.execute(
+        """
+        SELECT t.id, t.title, t.platform, t.is_group, p.name AS project,
+               COUNT(m.id) AS messages
+          FROM chat_threads t
+          LEFT JOIN projects p ON p.id = t.project_id
+          LEFT JOIN chat_messages m ON m.thread_id = t.id
+         GROUP BY t.id
+         ORDER BY t.last_msg_at DESC
+        """
+    )
+    return [dict(row) for row in rows]
+
+
+def _bind_room(conn, thread_id: int, project_name: str) -> str:
+    """ผูกห้องเข้ากับไซต์ สร้างไซต์ใหม่ให้ถ้ายังไม่มี
+
+    ข้อความที่นำเข้าไปแล้วถือ project_id ของตัวเองอยู่ (คัดลอกจากห้องตอนบันทึก)
+    จึงต้องอัปเดตย้อนหลังด้วย ไม่งั้นการผูกจะมีผลกับข้อความใหม่เท่านั้น และ
+    ประวัติเก่าทั้งกองจะยังไม่มีไซต์
+    """
+    with conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE name = ?", (project_name,)
+        ).fetchone()
+        if row:
+            project_id = int(row["id"])
+            created = False
+        else:
+            cursor = conn.execute(
+                "INSERT INTO projects (name, type) VALUES (?, ?)",
+                (project_name, DEFAULT_PROJECT_TYPE),
+            )
+            project_id = int(cursor.lastrowid)
+            created = True
+
+        conn.execute(
+            "UPDATE chat_threads SET project_id = ? WHERE id = ?",
+            (project_id, thread_id),
+        )
+        conn.execute(
+            "UPDATE chat_messages SET project_id = ? WHERE thread_id = ?",
+            (project_id, thread_id),
+        )
+    return "สร้างไซต์ใหม่" if created else "ผูกกับไซต์เดิม"
+
+
+async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ดูห้องแชตที่เก็บไว้ และผูกห้องเข้ากับไซต์งาน
+
+    `/rooms`                  — ดูรายการ
+    `/rooms <เลขห้อง> <ไซต์>`  — ผูกห้องนั้นเข้ากับไซต์ (ไม่มีไซต์ก็สร้างให้)
+
+    มีไว้เพราะผู้รับเหมาเจ้าเดียวทำงานหลายไซต์ การแยกด้วยคำในข้อความไม่แม่น
+    แต่แยกด้วย "ห้อง" แม่นเสมอ — LINE ให้ groupId มาต่างกันอยู่แล้ว
+    """
+    conn = connect(DB_PATH)
+    try:
+        if not context.args:
+            rooms = _list_rooms(conn)
+            if not rooms:
+                await update.message.reply_text(
+                    "💬 ยังไม่มีห้องแชตในระบบ\n"
+                    "ส่งไฟล์ export จาก LINE เข้ามาก่อน"
+                )
+                return
+            lines = ["💬 **ห้องแชต**\n"]
+            for room in rooms[:20]:
+                site = room["project"] or "ยังไม่ผูกไซต์"
+                title = room["title"] or "ไม่ทราบชื่อ"
+                lines.append(
+                    f"`{room['id']}` {escape_md(title)}\n"
+                    f"     {room['messages']} ข้อความ · {escape_md(site)}"
+                )
+            lines.append("\nผูกไซต์: `/rooms <เลขห้อง> <ชื่อไซต์>`")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+
+        if len(context.args) < 2 or not context.args[0].isdigit():
+            await update.message.reply_text(
+                "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
+                "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
+                "ดูเลขห้องด้วย `/rooms`",
+                parse_mode="Markdown",
+            )
+            return
+
+        thread_id = int(context.args[0])
+        project_name = " ".join(context.args[1:]).strip()
+        room = conn.execute(
+            "SELECT id, title FROM chat_threads WHERE id = ?", (thread_id,)
+        ).fetchone()
+        if room is None:
+            await update.message.reply_text(
+                f"❌ ไม่มีห้องเลข {thread_id} — ดูเลขที่ถูกด้วย `/rooms`",
+                parse_mode="Markdown",
+            )
+            return
+
+        outcome = _bind_room(conn, thread_id, project_name)
+        moved = conn.execute(
+            "SELECT COUNT(*) AS n FROM chat_messages WHERE thread_id = ?", (thread_id,)
+        ).fetchone()["n"]
+        logger.info(
+            "ผูกห้อง %s เข้ากับไซต์ (%s) — ย้ายข้อความ %s ข้อความ",
+            thread_id, outcome, moved,
+        )
+        await update.message.reply_text(
+            f"✅ {escape_md(room['title'] or 'ห้อง ' + str(thread_id))}\n"
+            f"→ {escape_md(project_name)} ({escape_md(outcome)})\n"
+            f"ข้อความที่ติดไซต์ไปด้วย: {moved}",
+            parse_mode="Markdown",
+        )
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RE-CLASSIFY IMPORTED MESSAGES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ต่ำกว่าเส้นนี้ view ไม่นับให้อยู่แล้ว (cfg.min_classifier_confidence ใน 02_views.sql)
+# ข้อความพวกนี้คือของที่กฎเดาไม่ออก จึงเป็นชุดที่คุ้มที่สุดที่จะให้โมเดลดูใหม่
+RECLASSIFY_BELOW = 0.80
+
+# กันไม่ให้กดครั้งเดียวแล้วยิงเป็นพัน ๆ ครั้งโดยไม่ตั้งใจ
+RECLASSIFY_LIMIT = int(os.getenv("RECLASSIFY_LIMIT", "500"))
+
+
+def _messages_to_reclassify(db_path: str, limit: int) -> list:
+    """ข้อความขาเข้าที่ตัวคัดแยกเดิมไม่มั่นใจ เรียงใหม่ก่อนเก่า
+
+    เฉพาะ direction='in' — ข้อความของเราเองไม่ใช่สิ่งที่รอเราตอบ จึงไม่ต้องคัดแยก
+    (import_export ก็ข้ามให้อยู่แล้ว)
+
+    เปิดและปิด connection ในฟังก์ชันนี้เอง ตัวเชื่อมของ sqlite3 ผูกกับเธรดที่สร้าง
+    มัน ส่งเข้า asyncio.to_thread ข้ามเธรดไม่ได้ — บั๊กเดียวกับที่เคยทำให้ข้อความ
+    LINE หายไปเงียบ ๆ ใน #11 และโผล่ซ้ำใน #25
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, body
+              FROM chat_messages
+             WHERE direction = 'in'
+               AND body IS NOT NULL AND TRIM(body) <> ''
+               AND COALESCE(confidence, 0) < ?
+             ORDER BY sent_at DESC
+             LIMIT ?
+            """,
+            (RECLASSIFY_BELOW, limit),
+        )
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _apply_reclassification(db_path: str, rows: list, results: list) -> dict:
+    """เขียนผลใหม่ทับ นับว่าอะไรเปลี่ยนไปเป็นอะไร
+
+    เขียนทั้งสามคอลัมน์พร้อมกันเสมอ แถวที่มี intent แต่ confidence เป็น NULL
+    จะถูก view นับเหมือนมั่นใจ 100% (ดู apply_classification ใน line_webhook.py)
+    """
+    changed, moved = 0, {}
+    conn = connect(db_path)          # เปิดในเธรดที่ใช้ ดูเหตุผลข้างบน
+    try:
+        with conn:
+            for row, result in zip(rows, results):
+                before = conn.execute(
+                    "SELECT intent FROM chat_messages WHERE id = ?", (row["id"],)
+                ).fetchone()["intent"]
+                conn.execute(
+                    """
+                    UPDATE chat_messages
+                       SET intent = ?, urgency = ?, confidence = ?
+                     WHERE id = ?
+                    """,
+                    (result["intent"], result["urgency"],
+                     result["confidence"], row["id"]),
+                )
+                if before != result["intent"]:
+                    changed += 1
+                    key = f"{before or 'ไม่มี'} → {result['intent']}"
+                    moved[key] = moved.get(key, 0) + 1
+    finally:
+        conn.close()
+    return {"changed": changed, "moved": moved}
+
+
+async def reclassify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """คัดแยกข้อความที่นำเข้าไว้แล้วใหม่ด้วยโมเดล
+
+    ตัวคัดแยกเดิมเป็น regex มันจับคำ ไม่ได้เข้าใจประโยค ประวัติงานรีโนเวตจริง
+    ถูกจัดเป็น smalltalk ไป 80 จาก 99 ข้อความ ทั้งที่พูดเรื่องราคาและงวดเงิน
+
+    ทำเฉพาะข้อความที่ความมั่นใจต่ำกว่าเส้นที่ view ใช้ — ข้อความที่กฎมั่นใจอยู่แล้ว
+    ไม่ต้องเสียค่าเรียกโมเดลซ้ำ
+    """
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "❌ ยังไม่ได้ตั้ง OPENAI_API_KEY — คัดแยกด้วยโมเดลไม่ได้"
+        )
+        return
+
+    import asyncio
+
+    import llm_classifier
+
+    try:
+        rows = await asyncio.to_thread(
+            _messages_to_reclassify, DB_PATH, RECLASSIFY_LIMIT
+        )
+        if not rows:
+            await update.message.reply_text(
+                "✅ ไม่มีข้อความที่ต้องคัดแยกใหม่\n"
+                "ทุกข้อความขาเข้ามีความมั่นใจถึงเกณฑ์แล้ว"
+            )
+            return
+
+        await update.message.reply_text(
+            f"🧠 กำลังคัดแยกใหม่ {len(rows)} ข้อความด้วย {llm_classifier.MODEL}..."
+        )
+        results = await asyncio.to_thread(
+            llm_classifier.classify_all_sync, [row["body"] for row in rows]
+        )
+        summary = await asyncio.to_thread(
+            _apply_reclassification, DB_PATH, rows, results
+        )
+
+        lines = [
+            "🧠 **คัดแยกใหม่แล้ว**\n",
+            f"ตรวจ: {len(rows)} ข้อความ",
+            f"เปลี่ยนหมวด: {summary['changed']}",
+        ]
+        if summary["moved"]:
+            top = sorted(summary["moved"].items(), key=lambda kv: -kv[1])[:6]
+            lines.append("")
+            lines.extend(f"  {escape_md(k)}: {n}" for k, n in top)
+        logger.info(
+            "คัดแยกใหม่ %s ข้อความ เปลี่ยนหมวด %s", len(rows), summary["changed"]
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(api_failure_message(e, "คัดแยกข้อความใหม่"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION COMMAND
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2033,6 +2293,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("translate", translate_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
+    app.add_handler(CommandHandler("rooms", rooms_command))
+    app.add_handler(CommandHandler("reclassify", reclassify_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     

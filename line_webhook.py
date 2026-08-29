@@ -248,7 +248,9 @@ def verify_signature(channel_secret: str, body: bytes, signature: str) -> bool:
 
 REQUEST_RE = re.compile(
     # ขอ ต้องไม่ใช่ "ขอบคุณ/ขอโทษ/ขอแสดงความ" ซึ่งเป็นคำสุภาพ ไม่ใช่การขอของ
-    r"(ขอ(?!บคุณ|บพระคุณ|โทษ|แสดงความ)|ช่วย|รบกวน|ฝาก|กรุณา|ส่ง.*(ให้|มา)|ได้ไหม|ได้มั้ย"
+    # และต้องไม่ใช่ "ของ" ซึ่งเป็นคำที่เจอทุกประโยค — "ของถึงแล้ว" ไม่ใช่การขอ
+    # แต่เดิมถูกจัดเป็น request ที่ความมั่นใจ 0.86 ซึ่งเหนือเส้นที่ view ใช้
+    r"(ขอ(?!บคุณ|บพระคุณ|โทษ|แสดงความ|ง)|ช่วย|รบกวน|ฝาก|กรุณา|ส่ง.*(ให้|มา)|ได้ไหม|ได้มั้ย"
     r"|หน่อย|please|could you|can you)",
     re.IGNORECASE,
 )
@@ -1596,6 +1598,23 @@ async def _storage(request: web.Request) -> web.Response:
     return web.json_response(snapshot)
 
 
+def _build_classifier():
+    """ใช้โมเดลถ้าตั้ง OPENAI_API_KEY ไว้ ไม่งั้นใช้กฎ
+
+    _classify() ของ handler มี timeout และตกกลับไปใช้กฎให้อยู่แล้ว ตรงนี้จึงแค่
+    เลือกตัวที่ดีกว่าเมื่อมีให้ใช้ ไม่ต้องกันความล้มเหลวซ้ำอีกชั้น
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        return classify_message
+    try:
+        import llm_classifier
+    except ImportError:
+        logger.warning("โหลด llm_classifier ไม่ได้ — ใช้กฎแทน")
+        return classify_message
+    logger.info("ใช้ตัวคัดแยกด้วยโมเดล %s", llm_classifier.MODEL)
+    return llm_classifier.classify_message
+
+
 def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
     if handler is None:
         init_webhook_tables(DB_PATH)
@@ -1604,6 +1623,7 @@ def create_app(handler: Optional[LineWebhookHandler] = None) -> web.Application:
             channel_secret=LINE_CHANNEL_SECRET,
             client=LineClient(LINE_CHANNEL_ACCESS_TOKEN),
             reno=_build_reno_bridge(),
+            classifier=_build_classifier(),
         )
 
     app = web.Application(client_max_size=MAX_BODY_BYTES)
