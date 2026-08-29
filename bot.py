@@ -1396,6 +1396,18 @@ def _list_rooms(conn) -> list:
     return [dict(row) for row in rows]
 
 
+def _split_off_commands(args: list) -> tuple:
+    """แยกคำที่เป็นชื่อจริง ออกจากคำสั่งที่พิมพ์ต่อท้ายมาในบรรทัดเดียวกัน
+
+    พอเจอคำแรกที่ขึ้นต้นด้วย / ถือว่าชื่อจบแล้ว ที่เหลือเป็นคำสั่งทั้งหมด —
+    Telegram ส่งมาเป็นข้อความเดียว จึงมีแค่คำสั่งแรกเท่านั้นที่ทำงาน
+    """
+    for index, arg in enumerate(args):
+        if arg.startswith("/"):
+            return list(args[:index]), list(args[index:])
+    return list(args), []
+
+
 def _bind_room(conn, thread_id: int, project_name: str) -> str:
     """ผูกห้องเข้ากับไซต์ สร้างไซต์ใหม่ให้ถ้ายังไม่มี
 
@@ -1476,7 +1488,19 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         thread_id = int(context.args[0])
-        project_name = " ".join(context.args[1:]).strip()
+        # ผู้ใช้พิมพ์ "/rooms 2 Renovate เฉวง /reclassify" มาจริง คิดว่าบอทจะทำ
+        # ตามลำดับให้ ถ้ากินทุกคำจนจบ ชื่อไซต์จะกลายเป็น "Renovate เฉวง
+        # /reclassify" และคำสั่งที่สองก็ไม่ได้ทำงานด้วย เสียทั้งสองทาง
+        name_parts, trailing = _split_off_commands(context.args[1:])
+        project_name = " ".join(name_parts).strip()
+        if not project_name:
+            await update.message.reply_text(
+                "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
+                "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
+                "ดูเลขห้องด้วย `/rooms`",
+                parse_mode="Markdown",
+            )
+            return
         room = conn.execute(
             "SELECT id, title FROM chat_threads WHERE id = ?", (thread_id,)
         ).fetchone()
@@ -1495,12 +1519,19 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ผูกห้อง %s เข้ากับไซต์ (%s) — ย้ายข้อความ %s ข้อความ",
             thread_id, outcome, moved,
         )
-        await update.message.reply_text(
-            f"✅ {escape_md(room['title'] or 'ห้อง ' + str(thread_id))}\n"
-            f"→ {escape_md(project_name)} ({escape_md(outcome)})\n"
+        reply = [
+            f"✅ {escape_md(room['title'] or 'ห้อง ' + str(thread_id))}",
+            f"→ {escape_md(project_name)} ({escape_md(outcome)})",
             f"ข้อความที่ติดไซต์ไปด้วย: {moved}",
-            parse_mode="Markdown",
-        )
+        ]
+        if trailing:
+            reply.append(
+                "\n⚠️ "
+                + ", ".join("`" + escape_code(word) + "`" for word in trailing)
+                + " ไม่ได้ทำงาน และไม่ถูกนับเป็นชื่อไซต์\n"
+                "หนึ่งข้อความสั่งได้คำสั่งเดียว — พิมพ์แยกอีกบรรทัด"
+            )
+        await update.message.reply_text("\n".join(reply), parse_mode="Markdown")
     finally:
         conn.close()
 
