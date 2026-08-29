@@ -151,6 +151,8 @@ class TestNoUnescapedUserTextRemains(unittest.TestCase):
         "emoji",                                # ตัวเดียวกัน ผ่านตัวแปร
         "priority",                             # 'urgent'|'high'|'medium'|'low'
         "task_id", "note_id", "t['id']", "n['id']", "r['id']",   # เลขจากฐานข้อมูล
+        "thread_id",                            # int(context.args[0]) หลัง isdigit()
+        "moved",                                # COUNT(*) จาก sqlite — int เสมอ
         "len(done)", "voice.duration",
         "remind_at.strftime('%Y-%m-%d %H:%M')", "r['remind_at']",  # เวลา ISO
         "icons.get(storage_type, '📱')", "storage_type.title()", "current.title()",

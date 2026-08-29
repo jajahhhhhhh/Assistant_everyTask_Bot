@@ -1370,6 +1370,136 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHAT ROOMS ↔ PROJECTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# projects.type มี CHECK อยู่ห้าค่า งานที่ไม่เข้าพวกไหนเลยลงเป็น personal
+DEFAULT_PROJECT_TYPE = "personal"
+
+
+def _list_rooms(conn) -> list:
+    """ห้องแชตทั้งหมดพร้อมจำนวนข้อความและไซต์ที่ผูกไว้
+
+    เรียงตามข้อความล่าสุดก่อน ห้องที่คุยกันอยู่จึงอยู่บนสุดเสมอ
+    """
+    rows = conn.execute(
+        """
+        SELECT t.id, t.title, t.platform, t.is_group, p.name AS project,
+               COUNT(m.id) AS messages
+          FROM chat_threads t
+          LEFT JOIN projects p ON p.id = t.project_id
+          LEFT JOIN chat_messages m ON m.thread_id = t.id
+         GROUP BY t.id
+         ORDER BY t.last_msg_at DESC
+        """
+    )
+    return [dict(row) for row in rows]
+
+
+def _bind_room(conn, thread_id: int, project_name: str) -> str:
+    """ผูกห้องเข้ากับไซต์ สร้างไซต์ใหม่ให้ถ้ายังไม่มี
+
+    ข้อความที่นำเข้าไปแล้วถือ project_id ของตัวเองอยู่ (คัดลอกจากห้องตอนบันทึก)
+    จึงต้องอัปเดตย้อนหลังด้วย ไม่งั้นการผูกจะมีผลกับข้อความใหม่เท่านั้น และ
+    ประวัติเก่าทั้งกองจะยังไม่มีไซต์
+    """
+    with conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE name = ?", (project_name,)
+        ).fetchone()
+        if row:
+            project_id = int(row["id"])
+            created = False
+        else:
+            cursor = conn.execute(
+                "INSERT INTO projects (name, type) VALUES (?, ?)",
+                (project_name, DEFAULT_PROJECT_TYPE),
+            )
+            project_id = int(cursor.lastrowid)
+            created = True
+
+        conn.execute(
+            "UPDATE chat_threads SET project_id = ? WHERE id = ?",
+            (project_id, thread_id),
+        )
+        conn.execute(
+            "UPDATE chat_messages SET project_id = ? WHERE thread_id = ?",
+            (project_id, thread_id),
+        )
+    return "สร้างไซต์ใหม่" if created else "ผูกกับไซต์เดิม"
+
+
+async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ดูห้องแชตที่เก็บไว้ และผูกห้องเข้ากับไซต์งาน
+
+    `/rooms`                  — ดูรายการ
+    `/rooms <เลขห้อง> <ไซต์>`  — ผูกห้องนั้นเข้ากับไซต์ (ไม่มีไซต์ก็สร้างให้)
+
+    มีไว้เพราะผู้รับเหมาเจ้าเดียวทำงานหลายไซต์ การแยกด้วยคำในข้อความไม่แม่น
+    แต่แยกด้วย "ห้อง" แม่นเสมอ — LINE ให้ groupId มาต่างกันอยู่แล้ว
+    """
+    conn = connect(DB_PATH)
+    try:
+        if not context.args:
+            rooms = _list_rooms(conn)
+            if not rooms:
+                await update.message.reply_text(
+                    "💬 ยังไม่มีห้องแชตในระบบ\n"
+                    "ส่งไฟล์ export จาก LINE เข้ามาก่อน"
+                )
+                return
+            lines = ["💬 **ห้องแชต**\n"]
+            for room in rooms[:20]:
+                site = room["project"] or "ยังไม่ผูกไซต์"
+                title = room["title"] or "ไม่ทราบชื่อ"
+                lines.append(
+                    f"`{room['id']}` {escape_md(title)}\n"
+                    f"     {room['messages']} ข้อความ · {escape_md(site)}"
+                )
+            lines.append("\nผูกไซต์: `/rooms <เลขห้อง> <ชื่อไซต์>`")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+
+        if len(context.args) < 2 or not context.args[0].isdigit():
+            await update.message.reply_text(
+                "ใช้แบบนี้: `/rooms <เลขห้อง> <ชื่อไซต์>`\n"
+                "ตัวอย่าง: `/rooms 1 ลิปะน้อย`\n\n"
+                "ดูเลขห้องด้วย `/rooms`",
+                parse_mode="Markdown",
+            )
+            return
+
+        thread_id = int(context.args[0])
+        project_name = " ".join(context.args[1:]).strip()
+        room = conn.execute(
+            "SELECT id, title FROM chat_threads WHERE id = ?", (thread_id,)
+        ).fetchone()
+        if room is None:
+            await update.message.reply_text(
+                f"❌ ไม่มีห้องเลข {thread_id} — ดูเลขที่ถูกด้วย `/rooms`",
+                parse_mode="Markdown",
+            )
+            return
+
+        outcome = _bind_room(conn, thread_id, project_name)
+        moved = conn.execute(
+            "SELECT COUNT(*) AS n FROM chat_messages WHERE thread_id = ?", (thread_id,)
+        ).fetchone()["n"]
+        logger.info(
+            "ผูกห้อง %s เข้ากับไซต์ (%s) — ย้ายข้อความ %s ข้อความ",
+            thread_id, outcome, moved,
+        )
+        await update.message.reply_text(
+            f"✅ {escape_md(room['title'] or 'ห้อง ' + str(thread_id))}\n"
+            f"→ {escape_md(project_name)} ({escape_md(outcome)})\n"
+            f"ข้อความที่ติดไซต์ไปด้วย: {moved}",
+            parse_mode="Markdown",
+        )
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION COMMAND
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2033,6 +2163,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("translate", translate_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
+    app.add_handler(CommandHandler("rooms", rooms_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     
