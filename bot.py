@@ -1456,7 +1456,13 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"`{room['id']}` {escape_md(title)}\n"
                     f"     {room['messages']} ข้อความ · {escape_md(site)}"
                 )
-            lines.append("\nผูกไซต์: `/rooms <เลขห้อง> <ชื่อไซต์>`")
+            # เดิมเขียนเป็น "<เลขห้อง> <ชื่อไซต์>" ซึ่งผู้ใช้พิมพ์วงเล็บตามมาจริง
+            # หลายรอบ ตัวอย่างที่ก๊อปแล้วใช้ได้เลยจึงชัดกว่าช่องให้แทนค่า
+            lines.append(
+                "\nผูกไซต์: พิมพ์ /rooms เว้นวรรค เลขห้อง เว้นวรรค ชื่อไซต์\n"
+                "เช่น `/rooms " + str(rooms[0]["id"]) + " ลิปะน้อย`"
+                " — ไม่ต้องใส่วงเล็บ ไม่ต้องพิมพ์ชื่อห้อง"
+            )
             await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             return
 
@@ -1685,14 +1691,36 @@ MAX_EXPORT_BYTES = 8 * 1024 * 1024
 # `/task - Renovate "ฉันคือ W.ch♾️💵💰 "` มาจริง ๆ แล้วรุ่นที่ยึดหัวข้อความไว้
 # อ่านไม่เจอ บอทจึงนับข้อความของเขาเองเป็นขาเข้าทั้ง 722 ใบ
 # "me" ยังยึดหัวบรรทัดอยู่ ไม่งั้น "send me the file" จะกลายเป็นชื่อคน
+# ชื่อหยุดก่อน " /คำสั่ง" เสมอ — ผู้ใช้พิมพ์ caption ว่า
+# "ฉันคือ W.ch♾️💵💰 /rooms 1 ลิปะน้อย" มาจริง ถ้ากินยาวถึงท้ายบรรทัด ชื่อที่ได้
+# จะเป็น "W.ch♾️💵💰 /rooms 1 ลิปะน้อย" ซึ่งไม่ตรงกับผู้ส่งคนไหนเลย บอทเลยนับ
+# ทุกข้อความเป็นขาเข้าทั้งที่ผู้ใช้บอกชื่อมาถูกแล้ว
 _OWNER_HINT_RE = re.compile(
-    r"(?:ฉันคือ|ผมคือ|ดิฉันคือ|หนูคือ|เราคือ|^\s*me\b)\s*[:：]?\s*(?P<name>[^\n]+)",
+    r"(?:ฉันคือ|ผมคือ|ดิฉันคือ|หนูคือ|เราคือ|^\s*me\b)\s*[:：]?\s*"
+    r"(?P<name>(?:(?!\s+/)[^\n])+)",
     re.IGNORECASE | re.MULTILINE,
 )
 
 # อัญประกาศที่ล้อมชื่อไว้ต้องถูกปอกทิ้ง ไม่งั้นได้ชื่อ '"W.ch♾️💵💰"' ซึ่งไม่ตรง
 # กับชื่อผู้ส่งในไฟล์ และจะเงียบ ๆ ไม่ตรงกับใครเลย
 _OWNER_QUOTES = " \t\"'`«»“”‘’"
+
+
+# Telegram ไม่ส่ง caption ของไฟล์เข้า CommandHandler คำสั่งที่พิมพ์ติดมากับไฟล์
+# จึงเงียบหายไปเฉย ๆ ไม่มีทั้งผลลัพธ์และข้อผิดพลาด — ผู้ใช้ที่ไม่รู้ก็จะพิมพ์ซ้ำ
+# อีกหลายรอบโดยไม่รู้ว่าทำไมไม่มีอะไรเกิดขึ้น จับไว้เพื่อบอกให้รู้ตัว
+_CAPTION_COMMAND_RE = re.compile(r"(?:^|\s)(/[a-zA-Z][a-zA-Z0-9_]*)")
+
+
+def _commands_in_caption(caption: Optional[str]) -> list:
+    """คำสั่งที่ผู้ใช้พิมพ์มาใน caption ของไฟล์ เรียงตามที่เจอ ไม่ซ้ำ"""
+    if not caption:
+        return []
+    found = []
+    for name in _CAPTION_COMMAND_RE.findall(caption):
+        if name not in found:
+            found.append(name)
+    return found
 
 
 def _owner_from_caption(caption: Optional[str]) -> Optional[str]:
@@ -1817,6 +1845,16 @@ async def handle_chat_export(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         elif guessed:
             lines.append(f"\nเดาว่าคุณคือ {escape_md(owner)} — ถ้าผิดบอกได้")
+
+        stray = _commands_in_caption(update.message.caption)
+        if stray:
+            lines.append(
+                "\n⚠️ คำสั่ง "
+                + ", ".join("`" + escape_code(name) + "`" for name in stray)
+                + " ที่พิมพ์มาใน caption ไม่ได้ทำงาน\n"
+                "Telegram ไม่ส่ง caption ของไฟล์เข้าคำสั่ง — พิมพ์แยกเป็นข้อความ"
+                "ธรรมดาทีละบรรทัด"
+            )
 
         # นับอย่างเดียว ไม่เอาเนื้อความหรือชื่อคนลง log — ประวัติแชตเป็นข้อมูลส่วนตัว
         logger.info(

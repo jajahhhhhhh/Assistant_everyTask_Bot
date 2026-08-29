@@ -111,6 +111,29 @@ class TestTheImportLeavesATrace(BotDbCase):
         await self._run()
         self.assertEqual(len(self.rows("SELECT id FROM chat_messages")), 2)
 
+    async def test_a_command_typed_in_the_caption_is_called_out(self):
+        """เงียบไม่ได้ — ผู้ใช้พิมพ์ /rooms ติดมากับไฟล์แล้วรอผลอยู่"""
+        update, _ = await self._run(caption="ฉันคือ J /rooms 1 ลิปะน้อย")
+        reply = update.message.replies[-1]
+        self.assertIn("/rooms", reply)
+        self.assertIn("ไม่ได้ทำงาน", reply)
+
+    async def test_the_name_before_that_command_still_counts(self):
+        """เตือนเรื่องคำสั่งแล้ว แต่ต้องไม่ทิ้งชื่อที่เขาพิมพ์มาถูก"""
+        update, _ = await self._run(caption="ฉันคือ J /rooms 1 ลิปะน้อย")
+        reply = update.message.replies[-1]
+        self.assertNotIn("ไม่พบชื่อ", reply)
+        self.assertNotIn("ไม่รู้ว่าชื่อไหนคือคุณ", reply)
+        self.assertEqual(
+            [r["direction"] for r in
+             self.rows("SELECT direction FROM chat_messages ORDER BY id")],
+            ["in", "out"],
+        )
+
+    async def test_a_clean_caption_gets_no_command_warning(self):
+        update, _ = await self._run(caption="ฉันคือ J")
+        self.assertNotIn("ไม่ได้ทำงาน", update.message.replies[-1])
+
 
 if __name__ == "__main__":
     unittest.main()

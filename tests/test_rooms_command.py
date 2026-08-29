@@ -140,6 +140,28 @@ class TestRooms(BotDbCase):
         replies = await self.run_command("ลิปะน้อย", "1")
         self.assertIn("/rooms", replies[0])
 
+class TestRoomsHint(BotDbCase):
+    """คำใบ้ท้ายรายการต้องก๊อปไปใช้ได้เลย
+
+    เดิมเขียนว่า "/rooms <เลขห้อง> <ชื่อไซต์>" ผู้ใช้พิมพ์วงเล็บตามมาจริงสามรอบ
+    ติดกัน แล้วบอทก็เงียบทุกรอบ เพราะ args[0] ไม่ใช่ตัวเลข
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        line_export.import_from_text(
+            bot.DB_PATH, EXPORT, owner_name="Ann Lee", file_name="งานลิปะน้อย.txt"
+        )
+
+    async def test_the_hint_is_a_command_that_actually_runs(self):
+        update = FakeUpdate()
+        await bot.rooms_command(update, FakeContext())
+        reply = update.message.replies[0]
+        thread_id = self.rows("SELECT id FROM chat_threads")[0]["id"]
+        self.assertIn("/rooms " + str(thread_id) + " ", reply)
+        self.assertNotIn("<", reply)
+        self.assertNotIn(">", reply)
+
 
 if __name__ == "__main__":
     unittest.main()
