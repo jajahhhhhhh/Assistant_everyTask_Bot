@@ -1500,6 +1500,136 @@ async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RE-CLASSIFY IMPORTED MESSAGES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ต่ำกว่าเส้นนี้ view ไม่นับให้อยู่แล้ว (cfg.min_classifier_confidence ใน 02_views.sql)
+# ข้อความพวกนี้คือของที่กฎเดาไม่ออก จึงเป็นชุดที่คุ้มที่สุดที่จะให้โมเดลดูใหม่
+RECLASSIFY_BELOW = 0.80
+
+# กันไม่ให้กดครั้งเดียวแล้วยิงเป็นพัน ๆ ครั้งโดยไม่ตั้งใจ
+RECLASSIFY_LIMIT = int(os.getenv("RECLASSIFY_LIMIT", "500"))
+
+
+def _messages_to_reclassify(db_path: str, limit: int) -> list:
+    """ข้อความขาเข้าที่ตัวคัดแยกเดิมไม่มั่นใจ เรียงใหม่ก่อนเก่า
+
+    เฉพาะ direction='in' — ข้อความของเราเองไม่ใช่สิ่งที่รอเราตอบ จึงไม่ต้องคัดแยก
+    (import_export ก็ข้ามให้อยู่แล้ว)
+
+    เปิดและปิด connection ในฟังก์ชันนี้เอง ตัวเชื่อมของ sqlite3 ผูกกับเธรดที่สร้าง
+    มัน ส่งเข้า asyncio.to_thread ข้ามเธรดไม่ได้ — บั๊กเดียวกับที่เคยทำให้ข้อความ
+    LINE หายไปเงียบ ๆ ใน #11 และโผล่ซ้ำใน #25
+    """
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, body
+              FROM chat_messages
+             WHERE direction = 'in'
+               AND body IS NOT NULL AND TRIM(body) <> ''
+               AND COALESCE(confidence, 0) < ?
+             ORDER BY sent_at DESC
+             LIMIT ?
+            """,
+            (RECLASSIFY_BELOW, limit),
+        )
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _apply_reclassification(db_path: str, rows: list, results: list) -> dict:
+    """เขียนผลใหม่ทับ นับว่าอะไรเปลี่ยนไปเป็นอะไร
+
+    เขียนทั้งสามคอลัมน์พร้อมกันเสมอ แถวที่มี intent แต่ confidence เป็น NULL
+    จะถูก view นับเหมือนมั่นใจ 100% (ดู apply_classification ใน line_webhook.py)
+    """
+    changed, moved = 0, {}
+    conn = connect(db_path)          # เปิดในเธรดที่ใช้ ดูเหตุผลข้างบน
+    try:
+        with conn:
+            for row, result in zip(rows, results):
+                before = conn.execute(
+                    "SELECT intent FROM chat_messages WHERE id = ?", (row["id"],)
+                ).fetchone()["intent"]
+                conn.execute(
+                    """
+                    UPDATE chat_messages
+                       SET intent = ?, urgency = ?, confidence = ?
+                     WHERE id = ?
+                    """,
+                    (result["intent"], result["urgency"],
+                     result["confidence"], row["id"]),
+                )
+                if before != result["intent"]:
+                    changed += 1
+                    key = f"{before or 'ไม่มี'} → {result['intent']}"
+                    moved[key] = moved.get(key, 0) + 1
+    finally:
+        conn.close()
+    return {"changed": changed, "moved": moved}
+
+
+async def reclassify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """คัดแยกข้อความที่นำเข้าไว้แล้วใหม่ด้วยโมเดล
+
+    ตัวคัดแยกเดิมเป็น regex มันจับคำ ไม่ได้เข้าใจประโยค ประวัติงานรีโนเวตจริง
+    ถูกจัดเป็น smalltalk ไป 80 จาก 99 ข้อความ ทั้งที่พูดเรื่องราคาและงวดเงิน
+
+    ทำเฉพาะข้อความที่ความมั่นใจต่ำกว่าเส้นที่ view ใช้ — ข้อความที่กฎมั่นใจอยู่แล้ว
+    ไม่ต้องเสียค่าเรียกโมเดลซ้ำ
+    """
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "❌ ยังไม่ได้ตั้ง OPENAI_API_KEY — คัดแยกด้วยโมเดลไม่ได้"
+        )
+        return
+
+    import asyncio
+
+    import llm_classifier
+
+    try:
+        rows = await asyncio.to_thread(
+            _messages_to_reclassify, DB_PATH, RECLASSIFY_LIMIT
+        )
+        if not rows:
+            await update.message.reply_text(
+                "✅ ไม่มีข้อความที่ต้องคัดแยกใหม่\n"
+                "ทุกข้อความขาเข้ามีความมั่นใจถึงเกณฑ์แล้ว"
+            )
+            return
+
+        await update.message.reply_text(
+            f"🧠 กำลังคัดแยกใหม่ {len(rows)} ข้อความด้วย {llm_classifier.MODEL}..."
+        )
+        results = await asyncio.to_thread(
+            llm_classifier.classify_all_sync, [row["body"] for row in rows]
+        )
+        summary = await asyncio.to_thread(
+            _apply_reclassification, DB_PATH, rows, results
+        )
+
+        lines = [
+            "🧠 **คัดแยกใหม่แล้ว**\n",
+            f"ตรวจ: {len(rows)} ข้อความ",
+            f"เปลี่ยนหมวด: {summary['changed']}",
+        ]
+        if summary["moved"]:
+            top = sorted(summary["moved"].items(), key=lambda kv: -kv[1])[:6]
+            lines.append("")
+            lines.extend(f"  {escape_md(k)}: {n}" for k, n in top)
+        logger.info(
+            "คัดแยกใหม่ %s ข้อความ เปลี่ยนหมวด %s", len(rows), summary["changed"]
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(api_failure_message(e, "คัดแยกข้อความใหม่"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION COMMAND
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2164,6 +2294,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("mystorage", mystorage_command))
     app.add_handler(CommandHandler("rooms", rooms_command))
+    app.add_handler(CommandHandler("reclassify", reclassify_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     
