@@ -160,5 +160,53 @@ class TestTellingTheBotWhoYouAreAfterwards(BotDbCase):
         self.assertIsNone(again.owner_unmatched)
 
 
+class TestOwnerCaption(unittest.TestCase):
+    """caption ที่ผู้ใช้พิมพ์จริง ไม่ใช่ caption ที่เราหวังว่าเขาจะพิมพ์
+
+    ผู้ใช้พิมพ์คำสั่งต่อท้ายชื่อมาในบรรทัดเดียว เพราะคิดว่าบอทจะทำตามลำดับให้ ถ้า
+    ชื่อกินยาวถึงท้ายบรรทัด บอทจะหาไม่เจอสักคน แล้วนับทุกข้อความเป็นขาเข้าเงียบ ๆ
+    ทั้งที่เขาบอกชื่อมาถูกแล้ว
+    """
+
+    def test_a_command_typed_after_the_name_is_not_part_of_the_name(self):
+        caption = "ฉันคือ W.ch♾️💵💰 /rooms 1 ลิปะน้อย → /reclassify"
+        self.assertEqual(bot._owner_from_caption(caption), "W.ch♾️💵💰")
+
+    def test_a_plain_name_is_untouched(self):
+        self.assertEqual(bot._owner_from_caption("ฉันคือ Ann Lee"), "Ann Lee")
+
+    def test_a_slash_inside_the_name_itself_survives(self):
+        """"A/B" เป็นชื่อได้ ที่ต้องตัดคือ " /คำสั่ง" ซึ่งมีเว้นวรรคนำหน้า"""
+        self.assertEqual(bot._owner_from_caption("ฉันคือ A/B Studio"), "A/B Studio")
+
+    def test_quotes_are_still_stripped_after_the_cut(self):
+        self.assertEqual(bot._owner_from_caption('ฉันคือ "Ann" /rooms'), "Ann")
+
+    def test_no_hint_is_still_no_owner(self):
+        self.assertIsNone(bot._owner_from_caption("/rooms 1 ลิปะน้อย"))
+
+
+class TestCommandsInCaption(unittest.TestCase):
+    """คำสั่งใน caption ไม่ทำงาน — ต้องบอกให้รู้ ไม่ใช่เงียบ"""
+
+    def test_every_command_is_reported_in_order_without_repeats(self):
+        caption = "ฉันคือ W /rooms 1 ลิปะน้อย → /rooms 2 เฉวง → /reclassify"
+        self.assertEqual(
+            bot._commands_in_caption(caption), ["/rooms", "/reclassify"]
+        )
+
+    def test_a_caption_without_commands_reports_nothing(self):
+        self.assertEqual(bot._commands_in_caption("ฉันคือ Ann Lee"), [])
+
+    def test_no_caption_at_all_reports_nothing(self):
+        self.assertEqual(bot._commands_in_caption(None), [])
+
+    def test_a_url_is_not_mistaken_for_a_command(self):
+        """"https://a.co/rooms" ไม่ใช่คำสั่ง — ทับต้องขึ้นต้นคำ"""
+        self.assertEqual(
+            bot._commands_in_caption("ดูที่ https://a.co/rooms นะ"), []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
