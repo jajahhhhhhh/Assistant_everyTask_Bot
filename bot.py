@@ -1577,8 +1577,12 @@ def _apply_reclassification(db_path: str, rows: list, results: list) -> dict:
 
     เขียนทั้งสามคอลัมน์พร้อมกันเสมอ แถวที่มี intent แต่ confidence เป็น NULL
     จะถูก view นับเหมือนมั่นใจ 100% (ดู apply_classification ใน line_webhook.py)
+
+    passed คือจำนวนแถวที่ความมั่นใจใหม่ถึงเกณฑ์ของ view แล้ว — ทุกแถวที่เข้ามา
+    ที่นี่ยังไม่ถึงเกณฑ์ (ดูเงื่อนไขของ _messages_to_reclassify) ตัวเลขนี้จึงคือ
+    "ได้ข้อความคืนมาใช้งานกี่ข้อความ" ซึ่งเป็นสิ่งที่เจ้าของอยากรู้จริง ๆ
     """
-    changed, moved = 0, {}
+    changed, moved, passed = 0, {}, 0
     conn = connect(db_path)          # เปิดในเธรดที่ใช้ ดูเหตุผลข้างบน
     try:
         with conn:
@@ -1599,9 +1603,11 @@ def _apply_reclassification(db_path: str, rows: list, results: list) -> dict:
                     changed += 1
                     key = f"{before or 'ไม่มี'} → {result['intent']}"
                     moved[key] = moved.get(key, 0) + 1
+                if (result["confidence"] or 0) >= RECLASSIFY_BELOW:
+                    passed += 1
     finally:
         conn.close()
-    return {"changed": changed, "moved": moved}
+    return {"changed": changed, "moved": moved, "passed": passed}
 
 
 async def reclassify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1637,24 +1643,50 @@ async def reclassify_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(
             f"🧠 กำลังคัดแยกใหม่ {len(rows)} ข้อความด้วย {llm_classifier.MODEL}..."
         )
+        report = {}
         results = await asyncio.to_thread(
-            llm_classifier.classify_all_sync, [row["body"] for row in rows]
+            llm_classifier.classify_all_sync,
+            [row["body"] for row in rows],
+            report,
         )
         summary = await asyncio.to_thread(
             _apply_reclassification, DB_PATH, rows, results
         )
 
+        by_model = report.get("by_model", 0)
         lines = [
             "🧠 **คัดแยกใหม่แล้ว**\n",
             f"ตรวจ: {len(rows)} ข้อความ",
+            "คัดแยกด้วยโมเดล: " + str(by_model) + " / " + str(len(rows)),
             f"เปลี่ยนหมวด: {summary['changed']}",
+            f"ผ่านเกณฑ์ {RECLASSIFY_BELOW} แล้ว: {summary['passed']}",
         ]
         if summary["moved"]:
             top = sorted(summary["moved"].items(), key=lambda kv: -kv[1])[:6]
             lines.append("")
             lines.extend(f"  {escape_md(k)}: {n}" for k, n in top)
+
+        # ตกกลับไปใช้กฎเป็นพฤติกรรมที่ถูกต้องของข้อมูล แต่ถ้าไม่บอก เจ้าของจะอ่าน
+        # "เปลี่ยนหมวด: 0" แล้วสรุปว่ากฎเดิมถูกอยู่แล้ว ทั้งที่โมเดลไม่ได้ทำงานเลย
+        if by_model < len(rows):
+            lines.append("")
+            if by_model == 0:
+                lines.append("⚠️ โมเดลไม่ได้ทำงานเลย ผลทั้งหมดมาจากกฎเดิม")
+            else:
+                lines.append(
+                    "⚠️ อีก " + str(len(rows) - by_model) + " ข้อความใช้กฎเดิมแทน"
+                )
+            reasons = report.get("failures") or []
+            if reasons:
+                lines.append(
+                    "สาเหตุ: "
+                    + ", ".join("`" + escape_code(r) + "`" for r in reasons)
+                )
+
         logger.info(
-            "คัดแยกใหม่ %s ข้อความ เปลี่ยนหมวด %s", len(rows), summary["changed"]
+            "คัดแยกใหม่ %s ข้อความ โมเดล %s เปลี่ยนหมวด %s ผ่านเกณฑ์ %s เหตุ %s",
+            len(rows), by_model, summary["changed"], summary["passed"],
+            report.get("failures"),
         )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:

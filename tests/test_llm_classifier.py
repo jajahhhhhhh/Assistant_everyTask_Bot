@@ -205,7 +205,7 @@ class TestModelWins(unittest.TestCase):
         texts = [f"ข้อความที่ {n}" for n in range(7)]
         calls = []
 
-        def fake_batch(chunk):
+        def fake_batch(chunk, report=None):
             calls.append(len(chunk))
             return [{"intent": "smalltalk", "urgency": "normal", "confidence": 0.5}
                     for _ in chunk]
@@ -240,6 +240,75 @@ class FakeUpdate:
         self.message = FakeMessage()
 
 
+class TestTheReportSaysWhatActuallyRan(unittest.TestCase):
+    """อาการจริง: /reclassify ตอบ "ตรวจ 500 เปลี่ยนหมวด 0" ทั้งที่โมเดลไม่ได้ถูก
+    เรียกเลย เพราะเวลาโมเดลล้ม โค้ดตกกลับไปใช้ regex ตัวเดิม ซึ่งให้คำตอบเดิมเป๊ะ
+    ทุกแถวจึงนับว่า "ไม่เปลี่ยน" เจ้าของอ่านแล้วสรุปว่ากฎเดิมถูกอยู่แล้ว
+    """
+
+    TEXTS = ["ขอราคาหน่อยครับ", "สวัสดีครับ"]
+
+    def test_a_working_model_is_counted_as_the_model(self):
+        client = fake_openai(
+            {"results": [{"i": i, "intent": "decision", "urgency": "normal",
+                          "confidence": 0.9} for i in range(2)]}
+        )
+        report = {}
+        with mock.patch.object(llm_classifier, "_client", return_value=client):
+            llm_classifier.classify_all_sync(self.TEXTS, report)
+        self.assertEqual(report["by_model"], 2)
+        self.assertEqual(report["by_rules"], 0)
+        self.assertEqual(report.get("failures", []), [])
+
+    def test_a_failing_call_is_counted_as_rules_with_a_reason(self):
+        class AuthenticationError(RuntimeError):
+            pass
+
+        client = fake_openai(None, raises=AuthenticationError("boom"))
+        report = {}
+        with mock.patch.object(llm_classifier, "_client", return_value=client):
+            with self.assertLogs("llm_classifier", level="ERROR"):
+                llm_classifier.classify_all_sync(self.TEXTS, report)
+        self.assertEqual(report["by_model"], 0)
+        self.assertEqual(report["by_rules"], 2)
+        self.assertEqual(report["failures"], ["AuthenticationError"])
+
+    def test_the_reason_never_carries_the_provider_text(self):
+        """ต่อจาก #24 — รายงานที่ผู้ใช้เห็นต้องมีแค่ชื่อคลาส ไม่มีเนื้อความ"""
+        secret = "Incorrect API key provided: 8666****3RAI"
+        client = fake_openai(None, raises=RuntimeError(secret))
+        report = {}
+        with mock.patch.object(llm_classifier, "_client", return_value=client):
+            with self.assertLogs("llm_classifier", level="ERROR"):
+                llm_classifier.classify_all_sync(self.TEXTS, report)
+        self.assertNotIn(secret, json.dumps(report, ensure_ascii=False))
+        self.assertEqual(report["failures"], ["RuntimeError"])
+
+    def test_a_missing_key_says_which_setting_is_missing(self):
+        report = {}
+        with mock.patch.dict(llm_classifier.os.environ, {"OPENAI_API_KEY": ""}):
+            with mock.patch.object(llm_classifier, "_client", return_value=None):
+                llm_classifier.classify_all_sync(self.TEXTS, report)
+        self.assertEqual(report["failures"], ["ไม่ได้ตั้ง OPENAI_API_KEY"])
+
+    def test_a_partial_answer_splits_the_count(self):
+        client = fake_openai(
+            {"results": [{"i": 0, "intent": "request", "urgency": "normal",
+                          "confidence": 0.9}]}
+        )
+        report = {}
+        with mock.patch.object(llm_classifier, "_client", return_value=client):
+            llm_classifier.classify_all_sync(self.TEXTS, report)
+        self.assertEqual(report["by_model"], 1)
+        self.assertEqual(report["by_rules"], 1)
+        self.assertEqual(report["failures"], ["โมเดลตอบไม่ครบ"])
+
+    def test_the_report_is_optional(self):
+        """โค้ดเดิมเรียกโดยไม่ส่ง report — ต้องไม่พัง"""
+        with mock.patch.object(llm_classifier, "_client", return_value=None):
+            self.assertEqual(len(llm_classifier.classify_all_sync(self.TEXTS)), 2)
+
+
 class TestReclassifyCommand(BotDbCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -271,6 +340,44 @@ class TestReclassifyCommand(BotDbCase):
         finally:
             conn.close()
         self.assertEqual(bot._messages_to_reclassify(bot.DB_PATH, 100), [])
+
+    async def test_it_warns_when_the_model_never_ran(self):
+        """ของจริงที่เจอ: ตอบ "ตรวจ 500 / เปลี่ยนหมวด 0" โดยไม่บอกว่าโมเดลล้ม"""
+        client = fake_openai(None, raises=RuntimeError("upstream down"))
+        with mock.patch.object(bot, "OPENAI_API_KEY", "sk-test"), \
+             mock.patch.object(llm_classifier, "_client", return_value=client):
+            with self.assertLogs("llm_classifier", level="ERROR"):
+                replies = await self.run_command()
+        reply = replies[-1]
+        self.assertIn("โมเดลไม่ได้ทำงานเลย", reply)
+        self.assertIn("RuntimeError", reply)
+        self.assertNotIn("upstream down", reply)
+
+    async def test_a_working_model_gets_no_warning(self):
+        client = fake_openai(
+            {"results": [{"i": i, "intent": "decision", "urgency": "normal",
+                          "confidence": 0.88} for i in range(10)]}
+        )
+        with mock.patch.object(bot, "OPENAI_API_KEY", "sk-test"), \
+             mock.patch.object(llm_classifier, "_client", return_value=client):
+            replies = await self.run_command()
+        self.assertNotIn("⚠️", replies[-1])
+
+    async def test_it_says_how_many_messages_became_usable(self):
+        """ตัวเลขที่เจ้าของอยากรู้จริง: ได้ข้อความคืนมาใช้งานกี่ข้อความ
+
+        ทุกแถวที่เข้า /reclassify ยังไม่ถึงเกณฑ์ 0.80 ของ view — ถ้าโมเดลตอบมา
+        ต่ำกว่าเกณฑ์อีก ข้อความก็ยังถูกมองข้ามเหมือนเดิม "เปลี่ยนหมวด" จึงไม่ใช่
+        คำตอบว่างานคืบหน้าไหม
+        """
+        client = fake_openai(
+            {"results": [{"i": i, "intent": "decision", "urgency": "normal",
+                          "confidence": 0.42} for i in range(10)]}
+        )
+        with mock.patch.object(bot, "OPENAI_API_KEY", "sk-test"), \
+             mock.patch.object(llm_classifier, "_client", return_value=client):
+            replies = await self.run_command()
+        self.assertIn("ผ่านเกณฑ์ 0.8 แล้ว: 0", replies[-1])
 
     async def test_the_new_verdict_is_written_and_counted(self):
         client = fake_openai(
