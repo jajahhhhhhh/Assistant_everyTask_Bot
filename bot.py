@@ -1694,6 +1694,65 @@ async def reclassify_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SYNC TO DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ส่งข้อความที่เก็บไว้ขึ้นไปให้ dashboard ที่ ch-howtoniksen.com
+
+    ทำเป็นคำสั่งแยก ไม่ได้ยิงอัตโนมัติตอนข้อความเข้า เพราะเส้นทาง webhook เป็น
+    เส้นที่ LINE รอ 200 อยู่ ปลายทางที่สามที่ตอบช้าหรือล่มไม่ควรไปถ่วงตรงนั้น
+    """
+    import asyncio
+
+    import dashboard_bridge
+
+    if not dashboard_bridge.is_configured():
+        await update.message.reply_text(
+            "❌ ยังไม่ได้ตั้ง DASHBOARD_API_URL — ส่งขึ้น dashboard ไม่ได้"
+        )
+        return
+
+    def run():
+        conn = connect(DB_PATH)      # เปิดในเธรดที่ใช้ ดู _messages_to_reclassify
+        try:
+            return dashboard_bridge.sync(conn)
+        finally:
+            conn.close()
+
+    try:
+        await update.message.reply_text("📤 กำลังส่งข้อความขึ้น dashboard...")
+        result = await asyncio.to_thread(run)
+    except Exception as e:
+        await update.message.reply_text(api_failure_message(e, "ส่งขึ้น dashboard"))
+        return
+
+    lines = [
+        "📤 **ส่งขึ้น dashboard แล้ว**\n",
+        "ส่งสำเร็จ: " + str(result["sent"]) + " ข้อความ",
+    ]
+    if result["left"]:
+        lines.append("ยังเหลือ: " + str(result["left"]))
+    if result["error"]:
+        # เหตุผลเป็นชื่อคลาสหรือรหัส HTTP เท่านั้น เนื้อคำตอบของเซิร์ฟเวอร์อยู่ใน
+        # log — มันพา header ของ auth ออกมาได้ (บทเรียนเดียวกับ #24)
+        lines.append("")
+        lines.append("⚠️ หยุดกลางทาง สาเหตุ: `" + escape_code(result["error"]) + "`")
+        if result["error"] == "HTTP 401":
+            lines.append("รหัส basic auth ของ Caddy ไม่ถูก — ตั้ง DASHBOARD_API_USER "
+                         "กับ DASHBOARD_API_PASSWORD ใน Railway")
+    elif result["sent"] == 0:
+        lines.append("")
+        lines.append("ทุกข้อความขึ้นไปครบแล้ว ไม่มีอะไรต้องส่ง")
+
+    logger.info(
+        "ซิงก์ dashboard: ค้าง %s ส่ง %s เหลือ %s เหตุ %s",
+        result["pending"], result["sent"], result["left"], result["error"],
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION COMMAND
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2391,6 +2450,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("mystorage", mystorage_command))
     app.add_handler(CommandHandler("rooms", rooms_command))
     app.add_handler(CommandHandler("reclassify", reclassify_command))
+    app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     
