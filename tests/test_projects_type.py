@@ -38,8 +38,12 @@ class TestProjectType(unittest.TestCase):
                 self.insert(f"งาน {index}", type_)
 
     def test_an_empty_type_is_still_refused(self):
-        """ยังต้องบังคับให้ระบุอะไรสักอย่าง ไม่ใช่ปล่อยผ่านทุกกรณี"""
-        for bad in ("", "   "):
+        """ยังต้องบังคับให้ระบุอะไรสักอย่าง ไม่ใช่ปล่อยผ่านทุกกรณี
+
+        รวมแท็บและขึ้นบรรทัดใหม่ด้วย — TRIM(x) ของ SQLite ที่ไม่ระบุอักขระ
+        ตัดเฉพาะช่องว่างธรรมดา ค่าอย่าง "\t" จึงเคยผ่านไปได้ทั้งที่ว่างเปล่า
+        """
+        for bad in ("", "   ", "\t", "\n", "\r", " \t\n "):
             with self.subTest(value=repr(bad)):
                 with self.assertRaises(sqlite3.IntegrityError):
                     self.insert(f"งาน{bad!r}", bad)
