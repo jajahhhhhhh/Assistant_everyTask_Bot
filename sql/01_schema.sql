@@ -22,10 +22,17 @@ PRAGMA foreign_keys = ON;
 
 -- ---------- มิติ -------------------------------------------------------------
 
+-- type ไม่ใช่รายการตายตัว เพราะธุรกิจเกิดและปิดเร็วกว่า schema
+--   รายการเดิมคือ ('chowrest','niksen','barbar','b52','personal') ซึ่งพอถึงเวลา
+--   ก็ล้าสมัย: b52 ปิดไปแล้ว, barbar ไม่ได้ทำต่อ, ส่วน Airbnb ซึ่งเป็นรายได้หลัก
+--   ช่องทางเดียวตอนนี้ กลับไม่มีอยู่ในรายการเลย
+--   ไม่มีโค้ดตรงไหนอ่านค่า type — ทุก view เชื่อมด้วย project_id อย่างเดียว
+--   ข้อจำกัดนี้จึงไม่เคยปกป้องอะไร มีแต่บังคับให้ต้องแก้ schema ทุกครั้งที่เปิด
+--   หรือปิดธุรกิจสักอย่าง เหลือไว้แค่กันค่าว่างก็พอ
 CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
-  type        TEXT NOT NULL CHECK (type IN ('chowrest','niksen','barbar','b52','personal')),
+  type        TEXT NOT NULL CHECK (TRIM(type) <> ''),
   is_active   INTEGER NOT NULL DEFAULT 1
 );
 
