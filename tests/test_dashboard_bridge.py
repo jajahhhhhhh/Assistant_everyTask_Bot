@@ -105,6 +105,21 @@ class TestSync(BotDbCase):
         self.assertEqual(result["error"], "HTTP 401")
         self.assertGreater(result["left"], 0)
 
+    def test_a_failure_reports_the_url_it_called(self):
+        """404 อย่างเดียวแยกไม่ออกว่า URL ตั้งผิด หรือปลายทางไม่มี endpoint นั้น"""
+        def boom(payload):
+            raise dashboard_bridge.DashboardUnavailable("HTTP 404")
+
+        result = self.sync(boom)
+        self.assertEqual(
+            result["endpoint"],
+            "https://example.invalid/api/v1/renovation/messages:ingest",
+        )
+
+    def test_a_successful_run_does_not_bother_reporting_the_url(self):
+        result = self.sync(lambda payload: "remote-1")
+        self.assertIsNone(result["endpoint"])
+
     def test_a_failure_halfway_keeps_what_already_went_up(self):
         calls = {"n": 0}
 

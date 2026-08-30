@@ -1738,9 +1738,14 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # log — มันพา header ของ auth ออกมาได้ (บทเรียนเดียวกับ #24)
         lines.append("")
         lines.append("⚠️ หยุดกลางทาง สาเหตุ: `" + escape_code(result["error"]) + "`")
+        if result.get("endpoint"):
+            lines.append("ยิงไปที่: `" + escape_code(result["endpoint"]) + "`")
         if result["error"] == "HTTP 401":
             lines.append("รหัส basic auth ของ Caddy ไม่ถูก — ตั้ง DASHBOARD_API_USER "
                          "กับ DASHBOARD_API_PASSWORD ใน Railway")
+        elif result["error"] == "HTTP 404":
+            lines.append("ที่อยู่ต้องลงท้ายด้วย /api/v1/renovation/messages:ingest "
+                         "ถ้าไม่มี /api อยู่ในนั้น แปลว่า DASHBOARD_API_URL ตั้งไว้ผิด")
     elif result["sent"] == 0:
         lines.append("")
         lines.append("ทุกข้อความขึ้นไปครบแล้ว ไม่มีอะไรต้องส่ง")
