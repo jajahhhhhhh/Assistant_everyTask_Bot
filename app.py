@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 
 from aiohttp import web
@@ -48,8 +49,45 @@ async def start_web() -> web.AppRunner:
     return runner
 
 
+# Railway ตั้งชื่อ environment ของ pull request ว่า "<repo>-pr-<เลข>" เสมอ
+_PR_ENVIRONMENT_RE = re.compile(r"-pr-\d+$")
+
+
+def is_pr_environment(name: str | None = None) -> bool:
+    """โปรเซสนี้กำลังรันอยู่ใน environment ที่ Railway สร้างให้ pull request ไหม
+
+    ทำไมต้องรู้: Telegram ยอมให้มีผู้เรียก getUpdates ได้ทีละรายต่อหนึ่งโทเคน
+    เท่านั้น ใครขอก่อนได้ไป ข้อความนั้นก็หายจากคิวเลย environment ของ PR ถูก
+    คัดลอกตัวแปรมาจาก project ทั้งชุด รวมถึง TELEGRAM_BOT_TOKEN มันจึงกลายเป็น
+    ผู้เรียกรายที่สองที่แย่งข้อความไปราวครึ่งหนึ่ง แล้วเขียนลง volume ของตัวเอง
+    ซึ่งถูกลบทิ้งตอน PR ถูก merge
+
+    เกิดขึ้นจริงแล้ว: ประวัติแชท Renovate 325 ข้อความที่นำเข้าไประหว่างที่ PR #37
+    เปิดอยู่ ถูก environment pr-37 รับไปทั้งชุด แล้วหายไปพร้อมกับมันตอน merge
+
+    เข้มงวดไว้ก่อน — ตรงกับรูปแบบของ PR เท่านั้นจึงจะหยุด ชื่ออื่นทั้งหมด
+    รวมถึงตอนที่ตัวแปรนี้ไม่ได้ตั้งไว้ (รันในเครื่องตัวเอง) ยัง poll ตามปกติ
+    ผิดพลาดทางนี้แค่ทำให้ข้อความซ้ำ ผิดอีกทางคือบอทตัวจริงเงียบไปทั้งตัว
+    """
+    if name is None:
+        name = os.getenv("RAILWAY_ENVIRONMENT_NAME", "")
+    return bool(_PR_ENVIRONMENT_RE.search((name or "").strip()))
+
+
 async def start_telegram():
-    """เปิด Telegram polling ในลูปเดียวกับเว็บ คืน None ถ้าไม่ได้ตั้งโทเคน"""
+    """เปิด Telegram polling ในลูปเดียวกับเว็บ
+
+    คืน None เมื่อไม่ได้ตั้งโทเคน หรือเมื่อ environment นี้เป็นของ pull request
+    """
+    environment = os.getenv("RAILWAY_ENVIRONMENT_NAME", "")
+    if is_pr_environment(environment):
+        logger.warning(
+            "environment %s เป็นของ pull request — ไม่เปิด Telegram polling "
+            "เพราะจะแย่งข้อความไปจากบอทตัวจริง (เว็บและ health check ยังทำงาน)",
+            environment,
+        )
+        return None
+
     import bot
 
     if not bot.BOT_TOKEN:
