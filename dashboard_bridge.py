@@ -33,6 +33,7 @@ import os
 import sqlite3
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -47,6 +48,9 @@ DB_PATH = os.getenv(
 DEFAULT_LIMIT = int(os.getenv("DASHBOARD_SYNC_LIMIT", "200"))
 
 REQUEST_TIMEOUT = float(os.getenv("DASHBOARD_TIMEOUT", "15"))
+
+# เส้นทางฝั่ง dashboard — Caddy ตัดคำนำหน้า /api ออกก่อนส่งต่อให้ API
+INGEST_PATH = "/v1/renovation/messages:ingest"
 
 # ตารางของสะพานนี้เอง ไม่แตะ schema หลัก — ถอดสะพานออกก็แค่ทิ้งตารางนี้
 _SCHEMA = """
@@ -155,6 +159,31 @@ class DashboardUnavailable(RuntimeError):
     """ปลายทางตอบไม่ได้ — ข้อความยังอยู่ครบที่นี่ ค่อยส่งรอบหน้า"""
 
 
+def endpoint_url() -> str:
+    """ที่อยู่ที่สะพานนี้ยิงไป ในรูปที่เอาไปโชว์ผู้ใช้ได้
+
+    ตัด user:pass ที่อาจฝังมาใน URL ออกก่อนเสมอ — รูปแบบ
+    https://user:pass@host/api ใช้ได้จริงและใครก็ตั้งแบบนั้นได้ ถ้าไม่ตัด
+    รหัสจะไปโผล่ในแชต Telegram ค้างอยู่ในประวัติ ซึ่งเป็นบั๊กเดียวกับ #24
+    ที่เราเพิ่งอุดไป
+
+    คืนสตริงว่างเมื่อยังไม่ได้ตั้งค่า ผู้เรียกจะได้ไม่รายงานที่อยู่ที่ไม่มีจริง
+    ตอนที่ยังไม่มีการยิงอะไรออกไปเลย
+    """
+    base = (os.getenv("DASHBOARD_API_URL") or "").rstrip("/")
+    if not base:
+        return ""
+    parts = urllib.parse.urlsplit(base)
+    if parts.username or parts.password:
+        host = parts.hostname or ""
+        if parts.port:
+            host = host + ":" + str(parts.port)
+        base = urllib.parse.urlunsplit(
+            (parts.scheme, host, parts.path, parts.query, parts.fragment)
+        )
+    return base + INGEST_PATH
+
+
 def push(payload: Dict[str, Any]) -> Optional[str]:
     """ส่งข้อความเดียว คืน id ฝั่งโน้น
 
@@ -167,7 +196,7 @@ def push(payload: Dict[str, Any]) -> Optional[str]:
         raise DashboardUnavailable("ยังไม่ได้ตั้ง DASHBOARD_API_URL")
 
     request = urllib.request.Request(
-        base + "/v1/renovation/messages:ingest",
+        base + INGEST_PATH,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", **_auth_header()},
         method="POST",
@@ -223,6 +252,11 @@ def sync(conn: sqlite3.Connection, limit: int = DEFAULT_LIMIT) -> Dict[str, Any]
         "sent": sent,
         "left": len(rows) - sent,
         "error": failed_reason,
+        # ที่อยู่ที่ยิงไปจริง ๆ — 404 อย่างเดียวแยกไม่ออกว่า URL ตั้งผิด
+        # (เช่นตก /api) หรือปลายทางไม่มี endpoint นั้น
+        # None เมื่อไม่ได้ตั้งค่า: ตอนนั้นยังไม่มีการยิงอะไรออกไป จะรายงาน
+        # ที่อยู่ที่ไม่มีจริงไม่ได้
+        "endpoint": (endpoint_url() if failed_reason else "") or None,
     }
 
 

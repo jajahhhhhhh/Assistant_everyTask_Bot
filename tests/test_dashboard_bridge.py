@@ -105,6 +105,64 @@ class TestSync(BotDbCase):
         self.assertEqual(result["error"], "HTTP 401")
         self.assertGreater(result["left"], 0)
 
+    def test_a_failure_reports_the_url_it_called(self):
+        """404 อย่างเดียวแยกไม่ออกว่า URL ตั้งผิด หรือปลายทางไม่มี endpoint นั้น"""
+        def boom(payload):
+            raise dashboard_bridge.DashboardUnavailable("HTTP 404")
+
+        result = self.sync(boom)
+        self.assertEqual(
+            result["endpoint"],
+            "https://example.invalid/api/v1/renovation/messages:ingest",
+        )
+
+    def test_a_password_embedded_in_the_url_never_reaches_the_report(self):
+        """https://user:pass@host/api ใช้ได้จริง และรหัสต้องไม่หลุดไปในแชต"""
+        def boom(payload):
+            raise dashboard_bridge.DashboardUnavailable("HTTP 404")
+
+        with mock.patch.dict(
+            dashboard_bridge.os.environ,
+            {**ENV, "DASHBOARD_API_URL": "https://owner:hunter2@example.invalid/api"},
+        ):
+            with mock.patch.object(dashboard_bridge, "push", boom):
+                result = dashboard_bridge.sync(self.conn)
+        self.assertNotIn("hunter2", result["endpoint"])
+        self.assertNotIn("owner", result["endpoint"])
+        self.assertEqual(
+            result["endpoint"],
+            "https://example.invalid/api/v1/renovation/messages:ingest",
+        )
+
+    def test_a_port_survives_the_password_being_stripped(self):
+        def boom(payload):
+            raise dashboard_bridge.DashboardUnavailable("HTTP 404")
+
+        with mock.patch.dict(
+            dashboard_bridge.os.environ,
+            {**ENV, "DASHBOARD_API_URL": "https://u:p@example.invalid:8443/api"},
+        ):
+            with mock.patch.object(dashboard_bridge, "push", boom):
+                result = dashboard_bridge.sync(self.conn)
+        self.assertEqual(
+            result["endpoint"],
+            "https://example.invalid:8443/api/v1/renovation/messages:ingest",
+        )
+
+    def test_an_unset_url_reports_no_endpoint_at_all(self):
+        """ยังไม่ได้ตั้งค่า = ยังไม่เคยยิงอะไรออกไป จะรายงานที่อยู่ไม่ได้"""
+        def boom(payload):
+            raise dashboard_bridge.DashboardUnavailable("ยังไม่ได้ตั้ง DASHBOARD_API_URL")
+
+        with mock.patch.dict(dashboard_bridge.os.environ, {}, clear=True):
+            with mock.patch.object(dashboard_bridge, "push", boom):
+                result = dashboard_bridge.sync(self.conn)
+        self.assertIsNone(result["endpoint"])
+
+    def test_a_successful_run_does_not_bother_reporting_the_url(self):
+        result = self.sync(lambda payload: "remote-1")
+        self.assertIsNone(result["endpoint"])
+
     def test_a_failure_halfway_keeps_what_already_went_up(self):
         calls = {"n": 0}
 
