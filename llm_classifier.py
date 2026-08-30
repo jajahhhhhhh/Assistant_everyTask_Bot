@@ -104,7 +104,43 @@ def _client():
     return OpenAI(api_key=api_key)
 
 
-def classify_batch_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
+def _unavailable_reason() -> str:
+    """เหตุที่เรียกโมเดลไม่ได้ เป็นคำสั้น ๆ ที่ปลอดภัยพอจะเอาไปโชว์ผู้ใช้
+
+    ไม่มีข้อความจากผู้ให้บริการปนมา — บทเรียนจาก #24 ข้อความนั้นเคยมีเศษ
+    API key ติดมาด้วย
+    """
+    if not os.getenv("OPENAI_API_KEY", ""):
+        return "ไม่ได้ตั้ง OPENAI_API_KEY"
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return "ไม่ได้ติดตั้งไลบรารี openai"
+    return "สร้าง client ไม่ได้"
+
+
+def _note(report: Optional[Dict[str, Any]], by_rules: int, by_model: int,
+          reason: Optional[str]) -> None:
+    """บันทึกว่าก้อนนี้ได้คำตอบมาจากโมเดลกี่ข้อ จากกฎกี่ข้อ และล้มเพราะอะไร
+
+    ทำไมต้องมี: ตัวคัดแยกตกกลับไปใช้กฎอย่างเงียบ ๆ เสมอเมื่อโมเดลล้ม ซึ่งถูกแล้ว
+    สำหรับข้อมูล แต่ผิดสำหรับคน — /reclassify เคยตอบว่า "ตรวจ 500 เปลี่ยนหมวด 0"
+    ทั้งที่โมเดลไม่ได้ถูกเรียกเลยสักครั้ง เจ้าของอ่านแล้วนึกว่ากฎเดิมถูกอยู่แล้ว
+    """
+    if report is None:
+        return
+    report.setdefault("model", MODEL)
+    report["by_rules"] = report.get("by_rules", 0) + by_rules
+    report["by_model"] = report.get("by_model", 0) + by_model
+    if reason:
+        failures = report.setdefault("failures", [])
+        if reason not in failures:
+            failures.append(reason)
+
+
+def classify_batch_sync(texts: Sequence[str],
+                        report: Optional[Dict[str, Any]] = None,
+                        ) -> List[Dict[str, Any]]:
     """คัดแยกหลายข้อความในการเรียกครั้งเดียว คืนผลเรียงตามลำดับที่ส่งเข้า
 
     ทุกช่องที่โมเดลตอบไม่ได้หรือตอบไม่ผ่านการตรวจ จะถูกเติมด้วยผลของ regex
@@ -116,6 +152,7 @@ def classify_batch_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
 
     client = _client()
     if client is None:
+        _note(report, len(texts), 0, _unavailable_reason())
         return fallback
 
     numbered = [
@@ -136,6 +173,8 @@ def classify_batch_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
     except Exception as exc:
         # ไม่เอาข้อความของผู้ให้บริการออกไปไหน มันไปโผล่ในแชตผู้ใช้ได้ (ดู #24)
         logger.error("ตัวคัดแยกด้วยโมเดลล้มเหลว — ใช้กฎแทน: %s", exc, exc_info=exc)
+        # ชื่อคลาสเท่านั้น ตัวข้อความเก็บไว้ใน log — มันเคยมีเศษ API key ติดมา (#24)
+        _note(report, len(texts), 0, type(exc).__name__)
         return fallback
 
     results = list(fallback)
@@ -154,6 +193,10 @@ def classify_batch_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
             results[index] = cleaned
             seen += 1
 
+    _note(
+        report, len(texts) - seen, seen,
+        "โมเดลตอบไม่ครบ" if seen < len(texts) else None,
+    )
     if seen < len(texts):
         logger.info(
             "โมเดลตอบไม่ครบ %s จาก %s ข้อความ — ที่เหลือใช้กฎ",
@@ -162,11 +205,19 @@ def classify_batch_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
     return results
 
 
-def classify_all_sync(texts: Sequence[str]) -> List[Dict[str, Any]]:
-    """เหมือน classify_batch_sync แต่หั่นเป็นก้อนตาม BATCH_SIZE ให้เอง"""
+def classify_all_sync(texts: Sequence[str],
+                      report: Optional[Dict[str, Any]] = None,
+                      ) -> List[Dict[str, Any]]:
+    """เหมือน classify_batch_sync แต่หั่นเป็นก้อนตาม BATCH_SIZE ให้เอง
+
+    ส่ง dict ว่างมาทาง report ถ้าอยากรู้ว่าคำตอบมาจากโมเดลกี่ข้อ จากกฎกี่ข้อ
+    และล้มเพราะอะไร — ตัวเลขจะถูกบวกสะสมข้ามทุกก้อน
+    """
     results: List[Dict[str, Any]] = []
     for start in range(0, len(texts), BATCH_SIZE):
-        results.extend(classify_batch_sync(texts[start:start + BATCH_SIZE]))
+        results.extend(
+            classify_batch_sync(texts[start:start + BATCH_SIZE], report)
+        )
     return results
 
 
