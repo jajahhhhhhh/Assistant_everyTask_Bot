@@ -182,3 +182,59 @@ class TestExitCodes(ImporterCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBootHook(unittest.TestCase):
+    """app.import_declared_expenses — จุดที่เรียกจริงตอนบูต (มี volume แล้ว)"""
+
+    def setUp(self):
+        import app
+
+        self.app = app
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmp.name) / "boot.db")
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript((REPO_ROOT / "sql" / "01_schema.sql").read_text(encoding="utf-8"))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def rows(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM expenses").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_no_variable_means_no_work(self):
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"DATABASE_PATH": self.db_path}, clear=False):
+            os.environ.pop("EXPENSE_IMPORT_JSON", None)
+            with redirect_stdout(io.StringIO()):
+                self.app.import_declared_expenses()
+        self.assertEqual(self.rows(), 0)
+
+    def test_imports_and_is_idempotent_across_boots(self):
+        import os
+        from unittest import mock
+
+        env = {"DATABASE_PATH": self.db_path, "EXPENSE_IMPORT_JSON": json.dumps([ROW])}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(io.StringIO()):
+                self.app.import_declared_expenses()
+                self.app.import_declared_expenses()
+        self.assertEqual(self.rows(), 1, "บูตสองรอบต้องได้แถวเดียว")
+
+    def test_broken_payload_does_not_stop_boot(self):
+        import os
+        from unittest import mock
+
+        env = {"DATABASE_PATH": self.db_path, "EXPENSE_IMPORT_JSON": "{พัง"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(io.StringIO()):
+                self.app.import_declared_expenses()  # ต้องไม่โยน exception
+        self.assertEqual(self.rows(), 0)
