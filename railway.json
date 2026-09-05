@@ -5,6 +5,9 @@
   },
   "deploy": {
     "startCommand": "python app.py",
+    "preDeployCommand": [
+      "python scripts/import_expenses.py"
+    ],
     "healthcheckPath": "/healthz",
     "healthcheckTimeout": 60,
     "restartPolicyType": "ON_FAILURE",
