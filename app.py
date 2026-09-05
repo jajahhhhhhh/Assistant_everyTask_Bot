@@ -184,6 +184,26 @@ def describe_storage() -> None:
         )
 
 
+def import_declared_expenses() -> None:
+    """ลงบิลที่ประกาศไว้ใน EXPENSE_IMPORT_JSON — ไม่มีตัวแปร = ไม่ทำอะไร
+
+    ต้องทำที่นี่ ไม่ใช่ preDeployCommand: คอนเทนเนอร์ของ pre-deploy ไม่ได้ mount
+    volume จึงเปิด /data/assistant.db ไม่ได้เลย ("unable to open database file")
+    โปรเซสแอปคือที่เดียวที่เห็นฐานข้อมูลจริง
+
+    ตัวนำเข้ากันแถวซ้ำด้วย ref อยู่แล้ว บูตกี่รอบก็ปลอดภัย และห้ามพังการบูต
+    เพราะบิลลงไม่ได้ไม่ใช่เหตุผลที่บอททั้งตัวจะไม่ขึ้น
+    """
+    if not os.getenv("EXPENSE_IMPORT_JSON"):
+        return
+    try:
+        from scripts.import_expenses import main as import_expenses
+
+        import_expenses([])
+    except Exception:
+        logger.exception("นำบิลเข้าตาราง expenses ไม่สำเร็จ — ข้ามไปก่อน")
+
+
 async def run() -> None:
     describe_storage()
 
@@ -194,6 +214,8 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:  # Windows
             pass
+
+    import_declared_expenses()
 
     runner = await start_web()
     application = await start_telegram()
