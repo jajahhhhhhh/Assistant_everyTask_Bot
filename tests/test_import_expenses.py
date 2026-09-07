@@ -1,8 +1,8 @@
 """
 เทสต์ของ scripts/import_expenses.py
 
-สคริปต์นี้ถูกเรียกเป็น preDeployCommand ข้อกำหนดที่สำคัญที่สุดจึงไม่ใช่เรื่อง
-ข้อมูล แต่คือ "ห้ามทำให้ deploy ล้ม" — ทุกทางที่ผิดพลาดต้องจบด้วย exit code 0
+ตัวนำเข้าตัวเดียวกันนี้ถูกใช้ทั้งตอนบูตแอปและตอนเรียกเป็น CLI ข้อกำหนดสำคัญคือ
+"ห้ามทำให้ deploy หรือการบูตล้ม" — ทุกทางที่ผิดพลาดต้องจบแบบ fail-soft
 """
 
 import io
@@ -140,7 +140,7 @@ class TestImportRows(ImporterCase):
 
 
 class TestExitCodes(ImporterCase):
-    """preDeployCommand ล้ม = deploy ล้ม จึงต้องจบด้วย 0 เสมอ"""
+    """โหมด CLI ต้อง fail-soft เสมอ เพราะเคยถูกใช้ใน pre-deploy มาก่อน"""
 
     def run_script(self, env_value=None, extra_args=()):
         import os
