@@ -24,6 +24,19 @@ Commands:
     /scan           — Scan for actionable items
     /save           — Save pending items
     /skip           — Skip pending items
+    /note <text>    — File a note through the secretary pipeline
+    /log [n]        — Recent secretary log entries
+    /week           — Week in review: notes, spending, balance
+    /spend <amt> <desc> [#cat] [@payer] — Log a household expense
+    /balance        — Who owes who right now
+    /month [YYYY-MM]— Category rollup with month-over-month trend
+    /ledger [month] — Line-item expense ledger
+    /settle <amt>   — Record a repayment
+    /fund [YYYY-MM] — Shared food fund status
+    /topup <amt>    — Pay into the shared food fund
+    /closemonth     — Month-end settlement across fund and personal spending
+    /gsync          — Google sync status
+    /sync           — Push pending ledger rows to the shared sheet
     /translate <lang> <text> — Translate text to target language
     /tr <lang> <text>        — Shorthand for /translate
     /trmulti <langs> <text>  — Translate to multiple languages
@@ -34,13 +47,15 @@ Commands:
 Any free-form message is processed by the AI:
   • Tasks are extracted and stored automatically.
   • Links are summarized.
-  • Voice messages are transcribed.
+  • Voice messages are transcribed, summarised and filed.
+  • Photos of receipts are read into the shared ledger.
   • Reminders and events are created if detected.
   • A confirmation is sent back to the user.
 """
 
 import asyncio
 import logging
+import re
 import sys
 
 from telegram import Update
@@ -62,9 +77,12 @@ from assistant import (
     digest as digest_module,
     files as file_module,
     links as links_module,
+    finance as finance_module,
+    gsync,
     processor,
-    
+    receipts as receipt_module,
     reminders as reminder_module,
+    secretary,
     storage,
     tasks as task_module,
     translator,
@@ -99,7 +117,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Auto-features:*\n"
         "• Send me any message — I extract tasks automatically\n"
         "• Share a link — I'll summarize it\n"
-        "• Send a voice note — I'll transcribe it\n"
+        "• Send a voice note — I transcribe, summarise and file it\n"
+        "• Photograph a receipt — I read it into the shared ledger\n"
         "• Every 10 messages — I scan for action items\n\n"
         "Use /help for all commands!"
     )
@@ -116,6 +135,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/addtask `<description>` — Add a task\n"
         "/done `<id>` — Mark task as done\n"
         "/exporttasks — Export tasks as PDF\n\n"
+        "*Secretary* 🗂\n"
+        "/note `<text>` — File a note: summary, events, expenses, to-dos\n"
+        "/log `[n]` — Recent log entries\n"
+        "/week — Week in review\n"
+        "_Send a voice note or a photo of a receipt and it is filed automatically._\n\n"
+        "*Household finances* 💰\n"
+        "/spend `<amount> <what>` `[#category] [@payer] [!mine|!theirs]`\n"
+        "/balance — Who owes who right now\n"
+        "/month `[YYYY-MM]` — Category rollup + trend\n"
+        "/ledger `[YYYY-MM]` — Line-item ledger\n"
+        "/settle `<amount> [note]` — Record a repayment\n"
+        "/fund `[YYYY-MM]` — Shared food fund: in, spent, left\n"
+        "/topup `<amount> [@member]` — Pay into the food fund\n"
+        "/closemonth `[YYYY-MM]` — Settle the month across both tracks\n"
+        "/gsync — Google sync status · /sync — push pending rows\n\n"
         "*Smart Extraction*\n"
         "/scan — Scan chat for actionable items\n"
         "/save — Save pending items\n"
@@ -926,15 +960,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         # Save to conversation history
         ctx_module.record_user_message(conn, user_id, f"🎤 {transcribed_text}")
-        
-        # Process as regular text for task extraction etc.
-        new_tasks = task_module.extract_and_save_tasks(conn, user_id, transcribed_text)
-        if new_tasks:
-            task_lines = "\n".join(f"  • {t['title']}" for t in new_tasks)
-            await update.message.reply_text(
-                f"📝 Extracted {len(new_tasks)} task(s) from voice:\n{task_lines}",
-                parse_mode=ParseMode.MARKDOWN
+
+        # Secretary pipeline: summarise, file to the log, the shared calendar
+        # and the household ledger, then confirm exactly what was recorded.
+        if getattr(config, "SECRETARY_AUTO", True):
+            await _file_and_reply(
+                update, context, transcribed_text,
+                source="voice", source_ref=voice.file_id,
             )
+        else:
+            new_tasks = task_module.extract_and_save_tasks(conn, user_id, transcribed_text)
+            if new_tasks:
+                task_lines = "\n".join(f"  • {t['title']}" for t in new_tasks)
+                await update.message.reply_text(
+                    f"📝 Extracted {len(new_tasks)} task(s) from voice:\n{task_lines}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
         
         # Check for listing pattern
         if links_module.looks_like_listing(transcribed_text):
@@ -948,6 +989,449 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as exc:
         logger.error("Voice handling failed: %s", exc)
         await update.message.reply_text("❌ Voice processing failed.")
+
+
+# ── Secretary: shared log, calendar and household finances ────────────────────
+
+def _speaker_for(update: Update) -> str:
+    """
+    Attribute a message to a household member.
+
+    When PARTNER_TELEGRAM_ID is configured, that user's messages are filed under
+    PARTNER_NAME and everyone else's under OWNER_NAME.  Without it, everything is
+    filed under the owner, which is still correct for a single-account setup.
+    """
+    partner_id = str(getattr(config, "PARTNER_TELEGRAM_ID", "") or "").strip()
+    if partner_id and str(update.effective_user.id) == partner_id:
+        return getattr(config, "PARTNER_NAME", "Farid")
+    return getattr(config, "OWNER_NAME", "J")
+
+
+async def _push_to_google(conn, receipt: dict) -> str:
+    """
+    Mirror a filed note to Google Calendar and the shared ledger sheet.
+
+    Returns a one-line status suffix for the Telegram reply, or "" when sync is
+    not configured (the normal case until credentials are added).
+    """
+    if not gsync.is_configured():
+        return ""
+
+    bits = []
+    try:
+        if receipt.get("events"):
+            tally = gsync.push_events(conn, receipt["events"])
+            if tally.get("created"):
+                bits.append(f"{tally['created']} → 📅 shared calendar")
+        if receipt.get("expenses"):
+            result = gsync.push_expenses(conn, receipt["expenses"])
+            if result.get("appended"):
+                bits.append(f"{result['appended']} → 📊 shared sheet")
+    except Exception as exc:
+        logger.error("Google sync failed: %s", exc)
+        return "\n\n_⚠️ Google sync failed — saved locally._"
+
+    return ("\n\n_Synced: " + ", ".join(bits) + "_") if bits else ""
+
+
+async def _file_and_reply(update, context, text: str, source: str,
+                          source_ref: str = None, extraction: dict = None) -> None:
+    """Run one note through the secretary pipeline and report what was filed."""
+    conn = get_conn(context)
+    user_id = update.effective_user.id
+    speaker = _speaker_for(update)
+
+    receipt = secretary.file_note(
+        conn, user_id, text,
+        speaker=speaker, source=source, source_ref=source_ref,
+        extraction=extraction,
+    )
+    suffix = await _push_to_google(conn, receipt)
+    await update.message.reply_text(
+        secretary.format_intake(receipt, speaker) + suffix,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/note <text> — file a typed note through the secretary pipeline."""
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Usage: `/note Farid is paying rent on the 1st, 18000 baht`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await update.message.reply_text("🗂 Filing…")
+    await _file_and_reply(update, context, text, source="text")
+
+
+async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/log [n] — show the most recent secretary log entries."""
+    conn = get_conn(context)
+    limit = 15
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            pass
+    entries = secretary.get_log(conn, limit=limit)
+    await update.message.reply_text(
+        secretary.format_log(entries, limit=limit), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/week — the week in review: notes, spending and outstanding balance."""
+    conn = get_conn(context)
+    await update.message.reply_text(
+        secretary.weekly_digest(conn), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+# ── Finance commands ──────────────────────────────────────────────────────────
+
+def _parse_spend_args(args: list, default_payer: str) -> dict:
+    """
+    Parse ``/spend`` arguments.
+
+    Grammar:
+        ``<amount> [description...] [#category] [@payer] [!mine|!theirs|!fund]``
+
+    ``!fund`` marks the purchase as coming out of the shared food fund rather
+    than someone's pocket, so it draws the fund down instead of creating a debt.
+
+    Example: ``/spend 1250 Makro run #food @Farid !fund``
+    """
+    if not args:
+        raise ValueError("amount is required")
+
+    amount = None
+    category = None
+    payer = default_payer
+    split = "equal"
+    paid_from = None
+    words = []
+
+    for token in args:
+        if token.startswith("#"):
+            category = token[1:].lower()
+        elif token.startswith("@"):
+            payer = token[1:]
+        elif token.lower() in ("!fund", "!personal", "!own", "!mine-pocket"):
+            paid_from = "fund" if token.lower() == "!fund" else "personal"
+        elif token.startswith("!"):
+            split = token[1:].lower()
+        elif amount is None:
+            cleaned = token.replace(",", "").replace("฿", "")
+            multiplier = 1
+            if cleaned.lower().endswith("k"):
+                cleaned, multiplier = cleaned[:-1], 1000
+            try:
+                amount = float(cleaned) * multiplier
+            except ValueError:
+                words.append(token)
+        else:
+            words.append(token)
+
+    if amount is None:
+        raise ValueError("could not read an amount")
+
+    # Food is fund money by default; everything else comes from a pocket.
+    if paid_from is None:
+        paid_from = "fund" if category == "food" else "personal"
+
+    return {
+        "amount": amount,
+        "description": " ".join(words).strip(),
+        "category": category,
+        "payer": payer,
+        "split": split,
+        "paid_from": paid_from,
+    }
+
+
+async def cmd_spend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/spend <amount> [description] [#category] [@payer] [!mine|!theirs]"""
+    conn = get_conn(context)
+    try:
+        parsed = _parse_spend_args(context.args, _speaker_for(update))
+    except ValueError as exc:
+        await update.message.reply_text(
+            f"❌ {exc}\n\nUsage: `/spend 1250 Makro run #food @Farid`\n"
+            "`#category` one of: " + ", ".join(finance_module.CATEGORIES) + "\n"
+            "`!mine` you were only covering yourself · `!theirs` you fronted it all\n"
+            "`!fund` out of the shared food fund · `!personal` out of pocket\n"
+            "_Food defaults to the fund; everything else to personal._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    expense = finance_module.add_expense(
+        conn, update.effective_user.id,
+        amount=parsed["amount"],
+        description=parsed["description"],
+        category=parsed["category"],
+        payer=parsed["payer"],
+        payer_share=parsed["split"],
+        paid_from=parsed["paid_from"],
+        currency=getattr(config, "DEFAULT_CURRENCY", "THB"),
+        source="manual",
+    )
+
+    suffix = ""
+    if gsync.is_configured():
+        result = gsync.push_expenses(conn, [expense])
+        if result.get("appended"):
+            suffix = "\n\n_Synced → 📊 shared sheet_"
+
+    emoji = finance_module.CATEGORY_EMOJI.get(expense["category"], "•")
+    header = (
+        f"{emoji} Logged *{finance_module.format_money(expense['amount'], expense['currency'])}* "
+        f"— {expense['description'] or expense['category']}\n"
+    )
+
+    if expense["paid_from"] == "fund":
+        # Fund spending changes the fund, not the balance between them.
+        header += f"_From the food fund · {expense['category']} · `#{expense['id']}`_\n\n"
+        body = finance_module.format_fund(
+            finance_module.fund_status(conn, month=expense["period"])
+        )
+    else:
+        header += f"_{expense['payer']} paid · {expense['category']} · `#{expense['id']}`_\n\n"
+        body = finance_module.format_balance(finance_module.compute_balance(conn))
+
+    await update.message.reply_text(header + body + suffix, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/balance — who owes who right now."""
+    conn = get_conn(context)
+    await update.message.reply_text(
+        finance_module.format_balance(finance_module.compute_balance(conn)),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/month [YYYY-MM] — category rollup with month-over-month trend."""
+    conn = get_conn(context)
+    month = context.args[0] if context.args else None
+    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
+        await update.message.reply_text("Usage: `/month 2026-08`", parse_mode=ParseMode.MARKDOWN)
+        return
+    rollup = finance_module.monthly_rollup(
+        conn, month=month, currency=getattr(config, "DEFAULT_CURRENCY", "THB")
+    )
+    await update.message.reply_text(
+        finance_module.format_rollup(rollup), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ledger [YYYY-MM] — the line-item ledger."""
+    conn = get_conn(context)
+    month = context.args[0] if context.args and re.fullmatch(r"\d{4}-\d{2}", context.args[0]) else None
+    expenses = finance_module.list_expenses(conn, month=month, limit=60)
+    await update.message.reply_text(
+        finance_module.format_ledger(expenses), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/settle <amount> [note] — record a repayment that clears the balance."""
+    conn = get_conn(context)
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/settle 4500 transferred via SCB`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    try:
+        amount = float(context.args[0].replace(",", "").replace("฿", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Could not read that amount.")
+        return
+
+    payer = _speaker_for(update)
+    settlement = finance_module.add_settlement(
+        conn, update.effective_user.id,
+        amount=amount, payer=payer,
+        currency=getattr(config, "DEFAULT_CURRENCY", "THB"),
+        note=" ".join(context.args[1:]),
+    )
+    balances = finance_module.compute_balance(conn)
+    await update.message.reply_text(
+        f"🤝 Recorded *{finance_module.format_money(settlement['amount'], settlement['currency'])}* "
+        f"from {settlement['payer']} to {settlement['payee']}.\n\n"
+        + finance_module.format_balance(balances),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── Shared food fund ──────────────────────────────────────────────────────────
+
+async def cmd_fund(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/fund [YYYY-MM] — the shared food fund: paid in, spent, what is left."""
+    conn = get_conn(context)
+    month = context.args[0] if context.args else None
+    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
+        await update.message.reply_text("Usage: `/fund 2026-08`", parse_mode=ParseMode.MARKDOWN)
+        return
+    status = finance_module.fund_status(
+        conn, month=month, currency=getattr(config, "DEFAULT_CURRENCY", "THB")
+    )
+    await update.message.reply_text(
+        finance_module.format_fund(status), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/topup <amount> [@member] [YYYY-MM] — pay into the shared food fund."""
+    conn = get_conn(context)
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/topup 4000` · `/topup 440 @Farid` · `/topup 4000 2026-09`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    member = _speaker_for(update)
+    month = None
+    amount = None
+    for token in context.args:
+        if token.startswith("@"):
+            member = token[1:]
+        elif re.fullmatch(r"\d{4}-\d{2}", token):
+            month = token
+        elif amount is None:
+            cleaned = token.replace(",", "").replace("฿", "")
+            multiplier = 1000 if cleaned.lower().endswith("k") else 1
+            if multiplier == 1000:
+                cleaned = cleaned[:-1]
+            try:
+                amount = float(cleaned) * multiplier
+            except ValueError:
+                pass
+
+    if amount is None:
+        await update.message.reply_text("❌ Could not read that amount.")
+        return
+
+    month = month or finance_module.month_key()
+    # An amount added to a month that is already overdrawn is a top-up, not the
+    # regular monthly contribution — label it so the report reads honestly.
+    before = finance_module.fund_status(conn, month=month)
+    kind = "topup" if before["overdrawn"] else "contribution"
+
+    finance_module.add_contribution(
+        conn, update.effective_user.id, amount=amount, member=member, month=month,
+        currency=getattr(config, "DEFAULT_CURRENCY", "THB"), kind=kind,
+    )
+    await update.message.reply_text(
+        finance_module.format_fund(finance_module.fund_status(conn, month=month)),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_closemonth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/closemonth [YYYY-MM] — settle the month across the fund and personal spending."""
+    conn = get_conn(context)
+    month = context.args[0] if context.args else None
+    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
+        await update.message.reply_text(
+            "Usage: `/closemonth 2026-08`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    settlement = finance_module.month_settlement(
+        conn, month=month, currency=getattr(config, "DEFAULT_CURRENCY", "THB")
+    )
+    await update.message.reply_text(
+        finance_module.format_settlement(settlement), parse_mode=ParseMode.MARKDOWN
+    )
+
+
+# ── Google sync commands ──────────────────────────────────────────────────────
+
+async def cmd_gsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/gsync — show which Google targets are wired up."""
+    await update.message.reply_text(gsync.format_status(), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sync — push every not-yet-synced ledger row to the shared sheet."""
+    conn = get_conn(context)
+    if not gsync.is_configured():
+        await update.message.reply_text(
+            "⚪️ Google sync is not configured yet.\n"
+            "Set `GOOGLE_SERVICE_ACCOUNT_JSON` (or the OAuth trio) plus "
+            "`JF_CALENDAR_ID` and `LEDGER_SHEET_ID`, then try again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await update.message.reply_text("🔄 Syncing…")
+    result = gsync.sync_ledger(conn)
+    if result["status"] == "appended":
+        await update.message.reply_text(f"✅ Pushed {result['appended']} ledger row(s).")
+    elif result["status"] == "duplicate":
+        await update.message.reply_text("✅ Everything is already in sync.")
+    else:
+        await update.message.reply_text(f"⚠️ {result.get('reason', 'Sync skipped.')}")
+
+
+# ── Receipt photo handler ─────────────────────────────────────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Read a photographed receipt and file it as a ledger entry."""
+    if not update.message.photo:
+        return
+
+    if not receipt_module.is_available():
+        await update.message.reply_text(
+            "🧾 Receipt reading needs `OPENAI_API_KEY`.\n"
+            "You can still log it manually: `/spend 450 lunch #food`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text("🧾 Reading receipt…")
+
+    # Telegram sends progressively larger sizes; the last one is the largest.
+    photo = update.message.photo[-1]
+    path = await receipt_module.download_photo(context.bot, photo.file_id)
+    if path is None:
+        await update.message.reply_text("❌ Could not download that photo.")
+        return
+
+    parsed = receipt_module.parse_receipt(path)
+    if parsed is None:
+        await update.message.reply_text(
+            "❌ Couldn't read a total off that receipt.\n"
+            "Log it manually: `/spend 450 lunch #food`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        receipt_module.format_receipt(parsed), parse_mode=ParseMode.MARKDOWN
+    )
+
+    speaker = _speaker_for(update)
+    caption = (update.message.caption or "").strip()
+    extraction = {
+        "summary": f"Receipt from {parsed.get('merchant') or parsed['category']} "
+                   f"for {finance_module.format_money(parsed['total'], parsed['currency'])}"
+                   + (f". {caption}" if caption else ""),
+        "language": "en",
+        "events": [],
+        "expenses": [receipt_module.to_expense_payload(parsed, payer=speaker)],
+        "commitments": [],
+        "notes": [caption] if caption else [],
+        "questions": [],
+    }
+    await _file_and_reply(
+        update, context, caption or parsed.get("merchant", "receipt"),
+        source="receipt", source_ref=photo.file_id, extraction=extraction,
+    )
 
 
 # ── Bot bootstrap ─────────────────────────────────────────────────────────────
@@ -1011,7 +1495,29 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("then", cmd_then))
     app.add_handler(CommandHandler("enth", cmd_enth))
 
+    # Secretary — shared log, calendar and household finances
+    app.add_handler(CommandHandler("note", cmd_note))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("week", cmd_week))
+
+    # Household finances
+    app.add_handler(CommandHandler("spend", cmd_spend))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("month", cmd_month))
+    app.add_handler(CommandHandler("ledger", cmd_ledger))
+    app.add_handler(CommandHandler("settle", cmd_settle))
+
+    # Shared food fund
+    app.add_handler(CommandHandler("fund", cmd_fund))
+    app.add_handler(CommandHandler("topup", cmd_topup))
+    app.add_handler(CommandHandler("closemonth", cmd_closemonth))
+
+    # Google sync
+    app.add_handler(CommandHandler("gsync", cmd_gsync))
+    app.add_handler(CommandHandler("sync", cmd_sync))
+
     # Message handlers
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 

@@ -16,6 +16,11 @@ An **AI-powered personal assistant** Telegram bot that autonomously manages info
 | 🔍 **Smart Extraction** | Auto-scan conversations every 10 messages for actionable items |
 | 🔗 **Link Summarization** | Auto-fetch and summarize shared URLs with multilingual output |
 | 🎤 **Voice Transcription** | Transcribe voice messages using OpenAI Whisper |
+| 🗂 **Secretary** | Every voice note is transcribed, summarised, and filed: events → calendar, money → ledger, promises → tasks |
+| 💰 **Household Ledger** | Two-track shared money: a common food fund plus split personal spending, with a running who-owes-who balance and monthly trends |
+| 🍜 **Food Fund** | Monthly contributions, drawdown, overdraft and equal top-ups — modelled the way the household actually settles |
+| 🧾 **Receipt Capture** | Photograph a receipt and it is read into the ledger — merchant, total, currency, date, category |
+| 🔗 **Google Sync** | Push events to a shared Google Calendar and ledger rows to a shared Google Sheet |
 | 📋 **Smart Summaries** | Summarise conversations (short / detailed / executive) |
 | 🌅 **Daily Digest** | AI-generated morning digest with tasks, appointments, and recommendations |
 | 📊 **Progress Reports** | Completion rates, overdue items, weekly summaries |
@@ -48,7 +53,11 @@ Assistant_everyTask_Bot/
 │   ├── links.py                  # Link fetching and summarization
 │   ├── projects.py               # Project management and AI analysis
 │   ├── digest.py                 # Daily digest generation
-│   └── autoscan.py               # Auto-extraction of actionable items
+│   ├── autoscan.py               # Auto-extraction of actionable items
+│   ├── secretary.py              # Note → summary + events + expenses + to-dos
+│   ├── finance.py                # Shared household ledger, balance, rollups
+│   ├── receipts.py               # Receipt photo → ledger entry (vision)
+│   └── gsync.py                  # Google Calendar / Sheets / Drive sync
 └── tests/
     ├── test_storage.py
     ├── test_processor.py
@@ -249,3 +258,150 @@ All tests run without an OpenAI API key using the keyword-based fallback.
 - Advanced analytics dashboard
 - AI-driven business insights
 - Google Calendar / Outlook sync
+
+---
+
+## 🗂 Secretary mode
+
+The secretary layer turns a raw note into a filed record. One pipeline, four
+outputs, whether the note arrived as a voice message, a typed line or a photo of
+a receipt:
+
+```
+voice note / message / receipt photo
+        │
+        ├─► Whisper transcript (th / en / ru)
+        ├─► structured extraction  {summary, events, expenses, commitments, notes, questions}
+        │
+        ├─► 🗂 secretary log      — the searchable record of what was said
+        ├─► 📅 calendar events    — local, plus the shared Google calendar
+        ├─► 💸 ledger rows        — local, plus the shared Google sheet
+        └─► ✅ tasks              — with owner, due date and priority
+```
+
+You get one reply confirming exactly what was filed, so nothing lands silently.
+
+### Secretary commands
+
+| Command | Description |
+|---------|-------------|
+| `/note <text>` | File a typed note through the pipeline |
+| `/log [n]` | Recent log entries, grouped by day |
+| `/week` | Week in review: notes, spending and outstanding balance |
+
+Voice notes and receipt photos need no command — they are filed on arrival.
+Set `SECRETARY_AUTO=false` to fall back to plain transcription.
+
+### Household finance commands
+
+| Command | Description |
+|---------|-------------|
+| `/spend <amount> <what>` | Log an expense. Flags: `#category` `@payer` `!mine` `!theirs` `!fund` `!personal` |
+| `/balance` | Who owes who right now, per currency |
+| `/fund [YYYY-MM]` | Shared food fund — paid in, spent, what is left |
+| `/topup <amount> [@member]` | Pay into the shared food fund |
+| `/month [YYYY-MM]` | Category rollup with month-over-month trend |
+| `/ledger [YYYY-MM]` | Line-item ledger with source provenance |
+| `/settle <amount> [note]` | Record a repayment that clears the balance |
+| `/closemonth [YYYY-MM]` | Month-end settlement across both tracks |
+
+**Example:** `/spend 1250 Makro run #food @Farid`
+
+### The two tracks
+
+The household does not split everything. It runs two separate arrangements, and
+the ledger models both.
+
+**Food → the shared fund.** Both members pay an equal amount into a common fund
+each month. Food purchases draw it down. Nobody owes anybody for fund spending —
+at month end, if the fund is overdrawn, both top up equally.
+
+**Everything else → split.** Rent, utilities, transport and the rest are paid by
+one person and split, creating a debt between them.
+
+`/spend` routes by category: anything in `food` defaults to the fund, everything
+else to personal. Override either way with `!fund` or `!personal` — a meal you
+bought only for yourself is `!personal !mine`.
+
+### How splits work
+
+Personal expenses store `payer_share` — the fraction the payer owes themselves:
+
+| Flag | Share | Meaning |
+|------|-------|---------|
+| *(default)* / `!equal` | 0.5 | Split down the middle |
+| `!mine` | 1.0 | The payer was only covering themselves — no debt created |
+| `!theirs` | 0.0 | The payer fronted the whole thing for the other person |
+
+Fund expenses ignore the split entirely — the fund paid, not a person.
+
+Balances are computed per currency and never mixed. Amounts are stored as
+integer minor units (satang), so repeated splits never drift.
+
+### Accounting period vs. spend date
+
+An expense carries a `period` (`YYYY-MM`) separate from the date it was spent.
+A grocery run on 30 July settled out of the August fund belongs to August. Left
+unset, the period is the spend month. Every month-scoped report — `/fund`,
+`/month`, `/ledger`, `/closemonth` — filters on the period, not the date.
+
+### Month-end
+
+`/closemonth` closes both tracks at once: the fund top-up each member owes, the
+net of personal spending, and any imbalance in what each paid into the fund. It
+deliberately keeps the top-up out of the person-to-person transfer — that money
+goes into the fund, not to each other.
+
+### Categories
+
+`rent` · `food` · `household` · `utilities` · `transport` · `shared` · `other`
+
+Uncategorised expenses are classified by keyword across Thai, English and
+Russian before falling back to `other`.
+
+---
+
+## 🔗 Google sync setup
+
+Sync is entirely optional — everything works locally without it. To turn it on:
+
+**1. Pick an auth mode.**
+
+*Service account (recommended for Railway):* create one in Google Cloud
+Console, download the JSON key, and set `GOOGLE_SERVICE_ACCOUNT_JSON` to the
+whole JSON on one line. Then **share** the calendar, the sheet and the Drive
+folder with the service account's `...iam.gserviceaccount.com` email address —
+a service account sees nothing until you share with it.
+
+*OAuth refresh token:* set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and
+`GOOGLE_REFRESH_TOKEN` for the Google account that owns the calendar.
+
+**2. Point it at the targets.**
+
+```
+JF_CALENDAR_ID=...@group.calendar.google.com
+LEDGER_SHEET_ID=<the long id in the spreadsheet URL>
+DRIVE_FOLDER_ID=<the long id in the folder URL>
+```
+
+**3. Check it.** Run `/gsync` in Telegram — every configured target shows ✅.
+Run `/sync` to push any ledger rows recorded before sync was switched on.
+
+Sync is idempotent: a `gsync_map` table records what has already been pushed, so
+re-running never duplicates an event or a row.
+
+---
+
+## 🧪 Tests
+
+```bash
+python -m pytest tests/ -q
+```
+
+`tests/test_finance.py` covers split arithmetic, balance netting, settlements,
+multi-currency isolation and monthly trends. `tests/test_fund.py` covers the
+food fund — contributions, drawdown, overdraft, contribution imbalance, schema
+migration of an older database — and reproduces the household's real August 2026
+figures end to end against the MASTER sheet. `tests/test_secretary.py` covers
+the offline extraction fallback, filing, malformed-payload resilience and
+formatting. All run without network access.
