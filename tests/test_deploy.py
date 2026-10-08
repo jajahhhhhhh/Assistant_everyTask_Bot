@@ -107,6 +107,9 @@ class TestProcessConfig(unittest.TestCase):
             self.procfile["web"].strip(),
         )
 
+    def test_expense_import_no_longer_runs_in_predeploy(self):
+        self.assertNotIn("preDeployCommand", self.railway["deploy"])
+
     def test_health_check_path_is_served(self):
         self.assertEqual(self.railway["deploy"]["healthcheckPath"], "/healthz")
 
@@ -398,6 +401,39 @@ class TestHealthEndpoints(unittest.IsolatedAsyncioTestCase):
         payloads = [await response.json() for response in responses]
         self.assertEqual([r.status for r in responses], [200] * 12)
         self.assertEqual([p["status"] for p in payloads], ["ok"] * 12)
+
+
+class TestBootOrder(unittest.IsolatedAsyncioTestCase):
+    async def test_expenses_are_imported_before_services_start(self):
+        events = []
+        runner = mock.Mock()
+        runner.cleanup = mock.AsyncMock(side_effect=lambda: events.append("cleanup"))
+
+        stop = mock.Mock()
+        stop.set = mock.Mock()
+        stop.wait = mock.AsyncMock(return_value=None)
+
+        fake_loop = mock.Mock()
+        fake_loop.add_signal_handler = mock.Mock()
+
+        async def fake_start_web():
+            events.append("web")
+            return runner
+
+        async def fake_start_telegram():
+            events.append("telegram")
+            return None
+
+        with mock.patch.object(app, "describe_storage", side_effect=lambda: events.append("describe")):
+            with mock.patch.object(app, "import_declared_expenses", side_effect=lambda: events.append("import")):
+                with mock.patch.object(app, "start_web", side_effect=fake_start_web):
+                    with mock.patch.object(app, "start_telegram", side_effect=fake_start_telegram):
+                        with mock.patch.object(app.asyncio, "Event", return_value=stop):
+                            with mock.patch.object(app.asyncio, "get_running_loop", return_value=fake_loop):
+                                await app.run()
+
+        self.assertEqual(events[:4], ["describe", "import", "web", "telegram"])
+        runner.cleanup.assert_awaited_once()
 
 
 if __name__ == "__main__":
