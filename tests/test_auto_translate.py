@@ -295,6 +295,44 @@ class TestPairMode(AutoTranslateCase):
         self.assertNotIn("rate limited", update.message.replies[0])
 
 
+class TestTranslationLog(AutoTranslateCase):
+    """หนึ่งบรรทัดต่อการแปลหนึ่งครั้ง บอกห้องกับผล แต่ไม่มีเนื้อความ"""
+
+    async def test_success_is_logged_without_the_text(self):
+        bot.ChatTranslatePairs.set(GROUP, "th", "en")
+        self.completions.reply = "Can you send more info?"
+        with self.assertLogs("bot", level="INFO") as logs:
+            update = FakeUpdate("Можешь прислать больше инфы?", chat_id=GROUP, chat_type="supergroup")
+            await bot.handle_message(update, FakeContext())
+        line = "\n".join(logs.output)
+        self.assertIn("pair th/en", line)
+        self.assertIn(str(GROUP), line)
+        self.assertIn("ok", line)
+        self.assertNotIn("Можешь", line)
+        self.assertNotIn("more info", line)
+
+    async def test_skipped_and_failed_are_distinguishable(self):
+        bot.ChatTranslatePairs.set(GROUP, "th", "en")
+        with self.assertLogs("bot", level="INFO") as logs:
+            update = FakeUpdate("https://example.com", chat_id=GROUP, chat_type="supergroup")
+            await bot.handle_message(update, FakeContext())
+        self.assertIn("skipped", "\n".join(logs.output))
+
+        bot.client = FakeClient(completions=FakeCompletions(error=RuntimeError("boom")))
+        with self.assertLogs("bot", level="INFO") as logs:
+            update = FakeUpdate("Привет", chat_id=GROUP, chat_type="supergroup")
+            await bot.handle_message(update, FakeContext())
+        self.assertIn("failed", "\n".join(logs.output))
+
+    async def test_private_auto_mode_logs_too(self):
+        bot.StorageSettings.set_language(USER, "th")
+        bot.StorageSettings.set_auto_translate(USER, True)
+        with self.assertLogs("bot", level="INFO") as logs:
+            update = FakeUpdate("Hello world")
+            await bot.handle_message(update, FakeContext())
+        self.assertIn("auto->th", "\n".join(logs.output))
+
+
 class TestHasTranslatableText(unittest.TestCase):
     def test_letters_in_any_script_count(self):
         for text in ("Привет", "สวัสดี", "Hello", "19 ноября - 29 декабря", "ok 👍"):
