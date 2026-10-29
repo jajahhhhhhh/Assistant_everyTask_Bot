@@ -2603,14 +2603,21 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(storage_callback, pattern="^storage:"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern="^lang:"))
     
+    # ทุก MessageHandler รับเฉพาะข้อความใหม่ — MessageHandler ค่าเริ่มต้นจับ
+    # edited_message และ channel_post ด้วย ซึ่ง update.message เป็น None
+    # และตัวจัดการทั้งสามอ่าน update.message ตรง ๆ: การแก้ไขข้อความที่ส่งไปแล้ว
+    # จึงล้มด้วย AttributeError ลง log ทุกครั้ง (เห็นบน Railway 2026-10-29)
+    # ข้อความที่แก้ไขไม่ควรถูกนำเข้า/แปล/ถอดเสียงซ้ำอยู่แล้ว ข้ามไปเลยถูกต้องกว่า
+    new_only = filters.UpdateType.MESSAGE
+
     # Voice handler
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.VOICE & new_only, handle_voice))
 
     # ไฟล์ประวัติแชทที่ export มา
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_chat_export))
+    app.add_handler(MessageHandler(filters.Document.ALL & new_only, handle_chat_export))
     
     # Text handler (last)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & new_only, handle_message))
     
     return app
 

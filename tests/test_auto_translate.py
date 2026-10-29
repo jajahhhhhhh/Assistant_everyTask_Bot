@@ -192,3 +192,54 @@ class TestHandleMessage(AutoTranslateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEditedMessagesAreIgnored(unittest.TestCase):
+    """การแก้ไขข้อความที่ส่งไปแล้วต้องไม่เข้า handle_message
+
+    MessageHandler ค่าเริ่มต้นจับ edited_message ด้วย ซึ่ง update.message เป็น
+    None แล้ว handle_message ล้มด้วย AttributeError — เห็นใน log บน Railway
+    ทันทีที่ผู้ใช้แก้ข้อความหลังเปิด /autotr
+    """
+
+    def build(self):
+        original = bot.BOT_TOKEN
+        bot.BOT_TOKEN = "123456:AAFakeTokenForTestingOnly"
+        try:
+            return bot.build_application()
+        finally:
+            bot.BOT_TOKEN = original
+
+    def message_handlers(self):
+        from telegram.ext import MessageHandler
+
+        return [
+            handler
+            for group in self.build().handlers.values()
+            for handler in group
+            if isinstance(handler, MessageHandler)
+        ]
+
+    def test_every_message_handler_skips_edits(self):
+        import datetime
+
+        from telegram import Chat, Message, Update, User
+
+        handlers = self.message_handlers()
+        self.assertGreaterEqual(len(handlers), 3)
+
+        new = Message(
+            message_id=1,
+            date=datetime.datetime.now(datetime.timezone.utc),
+            chat=Chat(id=USER, type="private"),
+            from_user=User(id=USER, first_name="J", is_bot=False),
+            text="Hello",
+        )
+        for handler in handlers:
+            fresh = Update(update_id=1, message=new)
+            edited = Update(update_id=2, edited_message=new)
+            self.assertFalse(
+                handler.check_update(edited), f"{handler.callback.__name__} รับ edited_message"
+            )
+            if handler.callback is bot.handle_message:
+                self.assertTrue(handler.check_update(fresh))
