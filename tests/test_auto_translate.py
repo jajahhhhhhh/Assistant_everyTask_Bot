@@ -20,14 +20,20 @@ class FakeMessage:
     def __init__(self, text=""):
         self.text = text
         self.replies = []
+        self.reply_kwargs = []
 
     async def reply_text(self, text, **kwargs):
         self.replies.append(text)
+        self.reply_kwargs.append(kwargs)
+
+
+GROUP = -100123
 
 
 class FakeUpdate:
-    def __init__(self, text=""):
+    def __init__(self, text="", chat_id=USER, chat_type="private"):
         self.effective_user = SimpleNamespace(id=USER, first_name="J")
+        self.effective_chat = SimpleNamespace(id=chat_id, type=chat_type)
         self.message = FakeMessage(text)
 
 
@@ -192,6 +198,111 @@ class TestHandleMessage(AutoTranslateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPairMode(AutoTranslateCase):
+    """คู่ภาษาประจำห้อง — กลุ่มลูกค้ารัสเซียที่เจ้าของพิมพ์ไทย
+
+    ตั้งต่อ chat ไม่ใช่ต่อคน: ในกลุ่มคนอ่านคำแปลคือทุกคนในห้อง
+    """
+
+    async def send(self, text, chat_id=GROUP, chat_type="supergroup"):
+        update = FakeUpdate(text, chat_id=chat_id, chat_type=chat_type)
+        await bot.handle_message(update, FakeContext())
+        return update
+
+    async def command(self, *args, chat_id=GROUP, chat_type="supergroup"):
+        update = FakeUpdate(chat_id=chat_id, chat_type=chat_type)
+        await bot.autotr_command(update, FakeContext(*args))
+        return update.message.replies
+
+    async def test_group_without_a_pair_is_silent(self):
+        update = await self.send("Hello everyone")
+        self.assertEqual(update.message.replies, [])
+        self.assertEqual(self.completions.calls, [])
+
+    async def test_private_user_switch_does_not_leak_into_groups(self):
+        bot.StorageSettings.set_auto_translate(USER, True)
+        update = await self.send("Hello everyone")
+        self.assertEqual(update.message.replies, [])
+        self.assertEqual(self.completions.calls, [])
+
+    async def test_set_pair_explicitly(self):
+        replies = await self.command("th", "en")
+        self.assertEqual(bot.ChatTranslatePairs.get(GROUP), {"home": "th", "foreign": "en"})
+        self.assertIn(bot.LANGUAGES["th"], replies[-1])
+        self.assertIn(bot.LANGUAGES["en"], replies[-1])
+
+    async def test_on_in_a_group_uses_the_default_pair(self):
+        await self.command("on")
+        self.assertEqual(bot.ChatTranslatePairs.get(GROUP), {"home": "th", "foreign": "en"})
+        await self.command("off")
+        self.assertIsNone(bot.ChatTranslatePairs.get(GROUP))
+
+    async def test_bare_command_in_a_group_toggles(self):
+        await self.command()
+        self.assertIsNotNone(bot.ChatTranslatePairs.get(GROUP))
+        await self.command()
+        self.assertIsNone(bot.ChatTranslatePairs.get(GROUP))
+
+    async def test_group_on_never_touches_the_user_switch(self):
+        await self.command("on")
+        self.assertFalse(bot.StorageSettings.get_settings(USER)["auto_translate"])
+
+    async def test_unknown_or_identical_languages_are_rejected(self):
+        replies = await self.command("th", "xx")
+        self.assertIn("Unknown", replies[-1])
+        replies = await self.command("th", "th")
+        self.assertIn("ต่างกัน", replies[-1])
+        self.assertIsNone(bot.ChatTranslatePairs.get(GROUP))
+
+    async def test_pair_translates_and_quotes_the_original(self):
+        bot.ChatTranslatePairs.set(GROUP, "th", "en")
+        self.completions.reply = "Can you send more info?"
+        update = await self.send("Можешь прислать больше инфы?")
+        self.assertEqual(update.message.replies, ["🌐 Can you send more info?"])
+        self.assertTrue(update.message.reply_kwargs[0].get("do_quote"))
+        prompt = self.completions.calls[0]["messages"][0]["content"]
+        self.assertIn(bot.LANGUAGES["th"], prompt)
+        self.assertIn(bot.LANGUAGES["en"], prompt)
+        self.assertEqual(self.completions.calls[0]["messages"][1]["content"], "Можешь прислать больше инфы?")
+
+    async def test_pair_skips_links_numbers_and_emoji(self):
+        bot.ChatTranslatePairs.set(GROUP, "th", "en")
+        for text in ("https://chowrest-property.com/property/x", "19-29", "👍🙏", "17:56"):
+            update = await self.send(text)
+            self.assertEqual(update.message.replies, [], text)
+        self.assertEqual(self.completions.calls, [])
+
+    async def test_pair_works_in_a_private_chat_too(self):
+        bot.ChatTranslatePairs.set(USER, "th", "en")
+        update = await self.send("Hello", chat_id=USER, chat_type="private")
+        self.assertEqual(update.message.replies, ["🌐 สวัสดีโลก"])
+
+    async def test_private_off_clears_both_modes(self):
+        bot.ChatTranslatePairs.set(USER, "th", "en")
+        bot.StorageSettings.set_auto_translate(USER, True)
+        await self.command("off", chat_id=USER, chat_type="private")
+        self.assertIsNone(bot.ChatTranslatePairs.get(USER))
+        self.assertFalse(bot.StorageSettings.get_settings(USER)["auto_translate"])
+
+    async def test_api_error_is_posted_not_swallowed(self):
+        bot.ChatTranslatePairs.set(GROUP, "th", "en")
+        bot.client = FakeClient(completions=FakeCompletions(error=RuntimeError("rate limited")))
+        with self.assertLogs("bot", level="ERROR"):
+            update = await self.send("Привет")
+        self.assertEqual(len(update.message.replies), 1)
+        self.assertNotIn("rate limited", update.message.replies[0])
+
+
+class TestHasTranslatableText(unittest.TestCase):
+    def test_letters_in_any_script_count(self):
+        for text in ("Привет", "สวัสดี", "Hello", "19 ноября - 29 декабря", "ok 👍"):
+            self.assertTrue(bot._has_translatable_text(text), text)
+
+    def test_nothing_to_translate(self):
+        for text in ("", "   ", "123", "17:56", "👍🙏", "https://example.com/a_b", "+66 92 579 1876"):
+            self.assertFalse(bot._has_translatable_text(text), text)
 
 
 class TestEditedMessagesAreIgnored(unittest.TestCase):

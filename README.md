@@ -43,6 +43,23 @@ you send is translated into that language; a message already in it gets a short
 "already ไทย" acknowledgement instead of a reworded copy. `/autotr off` stops it.
 Messages typed during `/settings` setup (API keys, sheet ids) are never translated.
 
+### Pair mode — for a chat with a customer (works in groups)
+
+```
+/autotr th en
+```
+
+sets a language pair for *that chat*: anything written in Thai is posted back in
+English, anything in **any other language** (Russian, English, ...) is posted back
+in Thai, quoting the original message. In a group, `/autotr on` uses `th en` and
+`/autotr off` turns it off. Links, numbers, times and emoji-only messages are left
+alone.
+
+For the bot to see ordinary messages in a group, **privacy mode must be off**:
+BotFather → `/setprivacy` → pick the bot → `Disable`, then remove the bot from the
+group and add it again (Telegram applies the change only on re-add). Without
+that, the bot in a group receives commands only and the pair does nothing.
+
 ## Voice Messages
 
 Just send any voice message → Auto-transcribed by AI!
