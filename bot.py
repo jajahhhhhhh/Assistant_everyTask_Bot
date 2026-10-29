@@ -192,6 +192,32 @@ def api_failure_message(exc: BaseException, action: str, key_name: str = "") -> 
     return f"❌ {action}ไม่สำเร็จ ลองใหม่อีกครั้ง (รายละเอียดอยู่ใน log ของเซิร์ฟเวอร์)"
 
 
+def _is_failure_message(result: Optional[str]) -> bool:
+    """ผลจากตัวแปลเป็นข้อความผิดพลาดของเราเอง ไม่ใช่คำแปล"""
+    return bool(result) and result.startswith("❌")
+
+
+def log_translation(mode: str, chat, source_len: int, result: Optional[str]) -> None:
+    """บันทึกหนึ่งบรรทัดต่อการแปลหนึ่งครั้ง — ไม่เก็บเนื้อความ
+
+    log บน Railway เป็นที่เดียวที่บอกได้ว่าบอท *ได้รับ* ข้อความจากกลุ่มหรือไม่:
+    ตอนแรกมีแต่ log ตอนล้มเหลว จึงแยกไม่ออกระหว่าง "แปลสำเร็จเงียบ ๆ" กับ
+    "privacy mode กันข้อความไว้ไม่ถึงบอท" เก็บแค่ห้อง ชนิด ความยาว และผลลัพธ์
+    เพราะข้อความลูกค้าไม่ควรไปค้างอยู่ใน log ของเซิร์ฟเวอร์
+    """
+    chat_id = getattr(chat, "id", None)
+    chat_type = getattr(chat, "type", None)
+    if result is None:
+        outcome = "skipped"
+    elif _is_failure_message(result):
+        outcome = "failed"
+    else:
+        outcome = f"ok out={len(result)}"
+    logger.info(
+        "แปล[%s] chat=%s type=%s in=%d %s", mode, chat_id, chat_type, source_len, outcome
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1988,6 +2014,7 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Translating...")
     
     translated = await translate_text(text, target_lang)
+    log_translation(f"tr->{target_lang}", update.effective_chat, len(text), translated)
     
     await update.message.reply_text(
         f"🌐 **Translation**\n\n"
@@ -2618,6 +2645,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pair = ChatTranslatePairs.get(chat.id)
     if pair:
         translated = await pair_translate_text(text, pair["home"], pair["foreign"])
+        log_translation(f"pair {pair['home']}/{pair['foreign']}", chat, len(text), translated)
         if translated is not None:
             # ตอบแบบอ้างถึงข้อความต้นฉบับ — ในกลุ่มที่คุยกันเร็ว คำแปลลอย ๆ
             # ไม่รู้ว่าเป็นของใคร
@@ -2633,6 +2661,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if settings.get("auto_translate"):
         lang_code = settings.get("preferred_language", "en")
         translated = await auto_translate_text(text, lang_code)
+        log_translation(f"auto->{lang_code}", chat, len(text), translated)
         if translated is None:
             await update.message.reply_text(
                 f"✅ เป็น {LANGUAGES.get(lang_code, lang_code)} อยู่แล้ว"
