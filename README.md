@@ -25,6 +25,7 @@ AI-powered Telegram bot for productivity!
 | `/note <content>` | Save note |
 | `/notes` | View notes |
 | `/tr <lang> <text>` | Translate |
+| `/autotr [on\|off]` | Auto-translate every plain message to your `/language` |
 | `/settings` | Storage settings |
 | `/mystorage` | View settings |
 | `/language` | Set language |
@@ -36,6 +37,11 @@ AI-powered Telegram bot for productivity!
 /tr en สวัสดี → Hello
 /tr ja Good morning → おはようございます
 ```
+
+Auto mode: `/language` → pick ไทย, then `/autotr on`. Every plain text message
+you send is translated into that language; a message already in it gets a short
+"already ไทย" acknowledgement instead of a reworded copy. `/autotr off` stops it.
+Messages typed during `/settings` setup (API keys, sheet ids) are never translated.
 
 ## Voice Messages
 
