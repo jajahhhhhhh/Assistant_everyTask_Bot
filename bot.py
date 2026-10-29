@@ -221,6 +221,13 @@ def _add_missing_columns(cursor):
                 cursor.execute(
                     f"ALTER TABLE user_storage_settings ADD COLUMN {column} TEXT"
                 )
+        # สวิตช์แปลอัตโนมัติ (/autotr) เพิ่มทีหลังเช่นกัน ค่าเริ่มต้นต้องเป็นปิด
+        # เพราะผู้ใช้เดิมไม่เคยขอให้แปลทุกข้อความ
+        if "auto_translate" not in settings_columns:
+            cursor.execute(
+                "ALTER TABLE user_storage_settings "
+                "ADD COLUMN auto_translate INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def init_db():
@@ -276,6 +283,7 @@ def init_db():
             google_refresh_token TEXT,
             google_drive_folder_id TEXT,
             preferred_language TEXT DEFAULT 'en',
+            auto_translate INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -311,7 +319,7 @@ class StorageSettings:
         cursor.execute("""
             SELECT storage_type, airtable_api_key, airtable_base_id,
                    airtable_table_name, google_sheet_id, preferred_language,
-                   google_refresh_token, google_drive_folder_id
+                   google_refresh_token, google_drive_folder_id, auto_translate
             FROM user_storage_settings WHERE user_id = ?
         """, (user_id,))
         row = cursor.fetchone()
@@ -327,8 +335,9 @@ class StorageSettings:
                 "preferred_language": row[5] or "en",
                 "google_refresh_token": row[6],
                 "google_drive_folder_id": row[7],
+                "auto_translate": bool(row[8]),
             }
-        return {"storage_type": "local", "preferred_language": "en"}
+        return {"storage_type": "local", "preferred_language": "en", "auto_translate": False}
     
     @staticmethod
     def set_storage_type(user_id: int, storage_type: str):
@@ -428,6 +437,20 @@ class StorageSettings:
         conn.commit()
         conn.close()
     
+    @staticmethod
+    def set_auto_translate(user_id: int, enabled: bool):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user_storage_settings (user_id, auto_translate, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                auto_translate = excluded.auto_translate,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, 1 if enabled else 0))
+        conn.commit()
+        conn.close()
+
     @staticmethod
     def reset_to_local(user_id: int):
         conn = sqlite3.connect(DB_PATH)
@@ -1032,6 +1055,59 @@ async def translate_text(text: str, target_lang: str, source_lang: str = "auto")
         return api_failure_message(e, "แปลภาษา", "OPENAI_API_KEY")
 
 
+# คำที่โมเดลต้องตอบเมื่อข้อความเป็นภาษาเป้าหมายอยู่แล้ว — เทียบทั้งสตริง ไม่ใช่
+# substring เพราะคำแปลจริงอาจมีคำนี้อยู่ในประโยคได้
+_ALREADY_TARGET = "SAME"
+
+
+async def auto_translate_text(text: str, target_lang: str) -> Optional[str]:
+    """แปลข้อความธรรมดาเป็นภาษาที่ผู้ใช้ตั้งไว้ (/language) สำหรับโหมด /autotr
+
+    ต่างจาก translate_text ตรงที่ผู้ใช้ไม่ได้สั่งแปลข้อความนี้เอง จึงต้องรู้ว่า
+    ข้อความเป็นภาษาเป้าหมายอยู่แล้วหรือไม่ — ถ้าใช่คืน None ไม่งั้นข้อความไทยทุก
+    ข้อความจะถูก "แปล" เป็นไทยกลับมาเป็นคำพ้องที่ต่างจากต้นฉบับเล็กน้อย
+    ซึ่งอ่านแล้วเหมือนบอทพิมพ์ซ้ำผิด ๆ
+
+    ให้โมเดลตัดสินเรื่องภาษาเอง ไม่เดาจากช่วงอักขระ: ข้อความที่ปนไทย-อังกฤษ
+    หรือเป็นตัวเลขล้วนไม่มีทางเดาถูกด้วยกฎ และการเรียกครั้งเดียวทำสองอย่างได้
+    ข้อผิดพลาดของ API คืนเป็นข้อความเหมือน translate_text ผู้ใช้จะได้รู้ว่าทำไม
+    บอทเงียบ แทนที่จะคิดว่าสวิตช์ไม่ทำงาน
+    """
+    if not client:
+        return "❌ OpenAI API not configured"
+
+    import asyncio
+
+    try:
+        lang_name = LANGUAGES.get(target_lang, target_lang)
+
+        def do_translate():
+            return client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are a translator. Translate the user's message to {lang_name}. "
+                            f"Only output the translation, nothing else. "
+                            f"If the message is already written in {lang_name}, "
+                            f"output exactly {_ALREADY_TARGET} and nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=1000,
+            )
+
+        response = await asyncio.to_thread(do_translate)
+        translated = (response.choices[0].message.content or "").strip()
+        if not translated or translated.strip("\"'`.* ").upper() == _ALREADY_TARGET:
+            return None
+        return translated
+    except Exception as e:
+        return api_failure_message(e, "แปลภาษา", "OPENAI_API_KEY")
+
+
 async def transcribe_voice(file_path: str) -> str:
     """Transcribe voice message using OpenAI Whisper"""
     if not client:
@@ -1120,6 +1196,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━
 • `/tr <lang> <text>` - Translate
 • Example: `/tr th Hello world`
+• `/autotr on` - Auto-translate every message to your /language
 • Supports 20+ languages!
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -1164,6 +1241,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 `/tr th Hello` → สวัสดี
 `/tr en สวัสดี` → Hello
 `/tr ja Good morning` → おはよう
+`/autotr on` → every plain message is translated to your /language
+`/autotr off` → stop
 
 **Languages:** en, th, zh, ja, ko, vi, id, ms, es, fr, de, it, pt, ru, ar, hi, tl, my, km, lo
 
@@ -2186,6 +2265,46 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+def _autotr_status_text(settings: Dict[str, Any]) -> str:
+    lang_code = settings.get("preferred_language", "en")
+    lang_name = LANGUAGES.get(lang_code, lang_code)
+    if settings.get("auto_translate"):
+        return (
+            f"🌐 **Auto-translate: ON**\n\n"
+            f"ทุกข้อความธรรมดาที่ส่งมาจะถูกแปลเป็น **{lang_name}** ให้อัตโนมัติ\n"
+            f"เปลี่ยนภาษาด้วย /language • ปิดด้วย `/autotr off`"
+        )
+    return (
+        f"🌐 **Auto-translate: OFF**\n\n"
+        f"เปิดด้วย `/autotr on` — บอทจะแปลทุกข้อความธรรมดาเป็น **{lang_name}** "
+        f"(ตั้งภาษาด้วย /language)"
+    )
+
+
+async def autotr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """เปิด/ปิดการแปลข้อความธรรมดาอัตโนมัติ — /autotr, /autotr on, /autotr off"""
+    user_id = update.effective_user.id
+    arg = (context.args[0].lower() if context.args else "").strip()
+
+    if arg in ("on", "เปิด", "1", "yes"):
+        StorageSettings.set_auto_translate(user_id, True)
+    elif arg in ("off", "ปิด", "0", "no"):
+        StorageSettings.set_auto_translate(user_id, False)
+    elif arg == "":
+        # ไม่มีอาร์กิวเมนต์คือสลับค่า จะได้ไม่ต้องจำว่าตอนนี้เปิดอยู่หรือไม่
+        current = StorageSettings.get_settings(user_id).get("auto_translate", False)
+        StorageSettings.set_auto_translate(user_id, not current)
+    else:
+        await update.message.reply_text(
+            "Usage: `/autotr on` หรือ `/autotr off`", parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        _autotr_status_text(StorageSettings.get_settings(user_id)), parse_mode="Markdown"
+    )
+
+
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set preferred language"""
     keyboard = []
@@ -2216,7 +2335,8 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     StorageSettings.set_language(user_id, lang_code)
     
     await query.edit_message_text(
-        f"✅ Language set to **{LANGUAGES.get(lang_code, lang_code)}**",
+        f"✅ Language set to **{LANGUAGES.get(lang_code, lang_code)}**\n\n"
+        f"💡 `/autotr on` แปลทุกข้อความเป็นภาษานี้ให้อัตโนมัติ",
         parse_mode="Markdown"
     )
 
@@ -2303,11 +2423,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_setup_state.pop(user_id, None)
             return
     
+    # โหมดแปลอัตโนมัติ (/autotr) — อยู่หลังโหมด setup เสมอ: ข้อความระหว่าง
+    # ตั้งค่า Airtable/Sheets คือคีย์กับ id ไม่ใช่ประโยคที่ควรไปแปล
+    settings = StorageSettings.get_settings(user_id)
+    if settings.get("auto_translate"):
+        lang_code = settings.get("preferred_language", "en")
+        translated = await auto_translate_text(text, lang_code)
+        if translated is None:
+            await update.message.reply_text(
+                f"✅ เป็น {LANGUAGES.get(lang_code, lang_code)} อยู่แล้ว"
+            )
+        else:
+            await update.message.reply_text(
+                f"🌐 {LANGUAGES.get(lang_code, lang_code)}: {escape_md(translated)}",
+                parse_mode="Markdown"
+            )
+        return
+
     # Default: just acknowledge
     await update.message.reply_text(
         "💡 Try:\n"
         "• `/task <title>` - Add task\n"
         "• `/tr th Hello` - Translate\n"
+        "• `/autotr on` - Auto-translate every message\n"
         "• Send voice → Transcription",
         parse_mode="Markdown"
     )
@@ -2457,6 +2595,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("reclassify", reclassify_command))
     app.add_handler(CommandHandler("sync", sync_command))
     app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CommandHandler("autotr", autotr_command))
+    app.add_handler(CommandHandler("autotranslate", autotr_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     
     # Callback handlers
