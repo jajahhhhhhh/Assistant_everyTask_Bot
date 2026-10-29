@@ -289,6 +289,18 @@ def init_db():
         )
     """)
     
+    # คู่ภาษาประจำห้อง (/autotr th en) — ตั้งต่อ chat ไม่ใช่ต่อคน เพราะในกลุ่ม
+    # ทุกคนในห้องคือผู้รับคำแปล ไม่ใช่แค่คนที่พิมพ์คำสั่ง
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_translate_pairs (
+            chat_id INTEGER PRIMARY KEY,
+            home_lang TEXT NOT NULL,
+            foreign_lang TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Voice transcriptions log
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transcriptions (
@@ -1021,6 +1033,57 @@ class Storage:
         return [{"id": r[0], "content": r[1], "tags": r[2], "created_at": r[3]} for r in rows]
 
 
+class ChatTranslatePairs:
+    """คู่ภาษาของห้องแชต — ภาษาบ้าน (home) กับภาษาคู่สนทนา (foreign)
+
+    กฎมีข้อเดียว: ข้อความที่เป็นภาษาบ้านแปลเป็นภาษาคู่สนทนา ข้อความอื่น *ทุก*
+    ภาษาแปลเป็นภาษาบ้าน — ห้องที่ตั้ง th/en จึงรับรัสเซียได้ด้วยโดยไม่ต้องตั้งเพิ่ม
+    เพราะเจ้าของอ่านไทยอย่างเดียว ส่วนคู่สนทนาอ่านอังกฤษได้แม้จะพิมพ์รัสเซียมา
+    """
+
+    @staticmethod
+    def get(chat_id: int) -> Optional[Dict[str, str]]:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT home_lang, foreign_lang FROM chat_translate_pairs WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {"home": row[0], "foreign": row[1]}
+
+    @staticmethod
+    def set(chat_id: int, home: str, foreign: str) -> None:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            with conn:
+                conn.execute("""
+                    INSERT INTO chat_translate_pairs (chat_id, home_lang, foreign_lang, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        home_lang = excluded.home_lang,
+                        foreign_lang = excluded.foreign_lang,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (chat_id, home, foreign))
+        finally:
+            conn.close()
+
+    @staticmethod
+    def clear(chat_id: int) -> bool:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM chat_translate_pairs WHERE chat_id = ?", (chat_id,)
+                )
+                return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AI SERVICES (Translation & Transcription)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1104,6 +1167,59 @@ async def auto_translate_text(text: str, target_lang: str) -> Optional[str]:
         if not translated or translated.strip("\"'`.* ").upper() == _ALREADY_TARGET:
             return None
         return translated
+    except Exception as e:
+        return api_failure_message(e, "แปลภาษา", "OPENAI_API_KEY")
+
+
+# อักษรอย่างน้อยหนึ่งตัวที่ไม่ใช่ตัวเลขหรือขีดล่าง — ลิงก์ล้วน ตัวเลข เวลา หรือ
+# อีโมจิล้วนไม่มีอะไรให้แปล และโมเดลมักจะ "แปล" ของพวกนี้ด้วยการพิมพ์ซ้ำ
+_HAS_LETTERS = re.compile(r"[^\W\d_]")
+
+
+def _has_translatable_text(text: str) -> bool:
+    without_urls = re.sub(r"https?://\S+", " ", text or "")
+    return bool(_HAS_LETTERS.search(without_urls))
+
+
+async def pair_translate_text(text: str, home: str, foreign: str) -> Optional[str]:
+    """แปลตามคู่ภาษาของห้อง (ดู ChatTranslatePairs)
+
+    คืน None เมื่อไม่มีอะไรให้แปล (ลิงก์ ตัวเลข อีโมจิ) จะได้ไม่โพสต์ซ้ำใต้ทุก
+    ลิงก์ที่ส่งในกลุ่ม ข้อผิดพลาดของ API คืนเป็นข้อความเช่นเดียวกับ translate_text
+    """
+    if not _has_translatable_text(text):
+        return None
+    if not client:
+        return "❌ OpenAI API not configured"
+
+    import asyncio
+
+    try:
+        home_name = LANGUAGES.get(home, home)
+        foreign_name = LANGUAGES.get(foreign, foreign)
+
+        def do_translate():
+            return client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are a translator in a group chat. "
+                            f"If the user's message is written in {home_name}, translate it to {foreign_name}. "
+                            f"If it is written in any other language, translate it to {home_name}. "
+                            f"Keep names, numbers, dates and URLs as they are. "
+                            f"Only output the translation, nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=1000,
+            )
+
+        response = await asyncio.to_thread(do_translate)
+        translated = (response.choices[0].message.content or "").strip()
+        return translated or None
     except Exception as e:
         return api_failure_message(e, "แปลภาษา", "OPENAI_API_KEY")
 
@@ -1197,6 +1313,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `/tr <lang> <text>` - Translate
 • Example: `/tr th Hello world`
 • `/autotr on` - Auto-translate every message to your /language
+• `/autotr th en` - Pair mode for a chat: Thai → English, anything else → Thai
 • Supports 20+ languages!
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -1242,6 +1359,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 `/tr en สวัสดี` → Hello
 `/tr ja Good morning` → おはよう
 `/autotr on` → every plain message is translated to your /language
+`/autotr th en` → pair mode (also in groups): Thai → English, any other language → Thai
 `/autotr off` → stop
 
 **Languages:** en, th, zh, ja, ko, vi, id, ms, es, fr, de, it, pt, ru, ar, hi, tl, my, km, lo
@@ -2265,6 +2383,17 @@ async def mystorage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+def _pair_status_text(pair: Dict[str, str]) -> str:
+    home = LANGUAGES.get(pair["home"], pair["home"])
+    foreign = LANGUAGES.get(pair["foreign"], pair["foreign"])
+    return (
+        f"🌐 **Auto-translate: ON (ห้องนี้)**\n\n"
+        f"• ข้อความ **{escape_md(home)}** → แปลเป็น **{escape_md(foreign)}**\n"
+        f"• ข้อความภาษาอื่นทั้งหมด → แปลเป็น **{escape_md(home)}**\n\n"
+        f"เปลี่ยนคู่ด้วย `/autotr <home> <foreign>` • ปิดด้วย `/autotr off`"
+    )
+
+
 def _autotr_status_text(settings: Dict[str, Any]) -> str:
     lang_code = settings.get("preferred_language", "en")
     lang_name = LANGUAGES.get(lang_code, lang_code)
@@ -2277,29 +2406,89 @@ def _autotr_status_text(settings: Dict[str, Any]) -> str:
     return (
         f"🌐 **Auto-translate: OFF**\n\n"
         f"เปิดด้วย `/autotr on` — บอทจะแปลทุกข้อความธรรมดาเป็น **{lang_name}** "
-        f"(ตั้งภาษาด้วย /language)"
+        f"(ตั้งภาษาด้วย /language)\n"
+        f"หรือ `/autotr th en` — คู่ภาษาสำหรับคุยกับลูกค้า: ไทย → อังกฤษ, ภาษาอื่น → ไทย"
     )
 
 
-async def autotr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """เปิด/ปิดการแปลข้อความธรรมดาอัตโนมัติ — /autotr, /autotr on, /autotr off"""
-    user_id = update.effective_user.id
-    arg = (context.args[0].lower() if context.args else "").strip()
+# คู่ภาษาเริ่มต้นเมื่อสั่ง /autotr on ในกลุ่มโดยไม่ระบุคู่ — เจ้าของพิมพ์ไทย
+# ลูกค้าอ่านอังกฤษ
+DEFAULT_PAIR = ("th", "en")
 
-    if arg in ("on", "เปิด", "1", "yes"):
-        StorageSettings.set_auto_translate(user_id, True)
-    elif arg in ("off", "ปิด", "0", "no"):
-        StorageSettings.set_auto_translate(user_id, False)
-    elif arg == "":
-        # ไม่มีอาร์กิวเมนต์คือสลับค่า จะได้ไม่ต้องจำว่าตอนนี้เปิดอยู่หรือไม่
-        current = StorageSettings.get_settings(user_id).get("auto_translate", False)
-        StorageSettings.set_auto_translate(user_id, not current)
-    else:
+_AUTOTR_ON = ("on", "เปิด", "1", "yes")
+_AUTOTR_OFF = ("off", "ปิด", "0", "no")
+
+
+async def autotr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """เปิด/ปิดการแปลอัตโนมัติ
+
+    /autotr <home> <foreign>  ตั้งคู่ภาษาของห้องนี้ (ใช้ได้ทั้งกลุ่มและแชตส่วนตัว)
+    /autotr on | off | (ว่าง) ในกลุ่ม: เปิดคู่เริ่มต้น th/en, ปิด, หรือสลับ
+                              ในแชตส่วนตัว: สวิตช์แปลภาษาเดียวตาม /language
+    """
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+    chat_id = chat.id
+    is_group = chat.type != "private"
+    args = [a.lower().strip() for a in (context.args or [])]
+
+    if len(args) == 2:
+        unknown = [a for a in args if a not in LANGUAGES]
+        if unknown:
+            await update.message.reply_text(
+                f"❌ Unknown language: `{escape_code(', '.join(unknown))}`\n\n"
+                f"Available: en, th, ru, zh, ja, ko, vi, de, fr, es...",
+                parse_mode="Markdown",
+            )
+            return
+        if args[0] == args[1]:
+            await update.message.reply_text("❌ ต้องเป็นสองภาษาที่ต่างกัน เช่น `/autotr th en`", parse_mode="Markdown")
+            return
+        ChatTranslatePairs.set(chat_id, args[0], args[1])
         await update.message.reply_text(
-            "Usage: `/autotr on` หรือ `/autotr off`", parse_mode="Markdown"
+            _pair_status_text({"home": args[0], "foreign": args[1]}), parse_mode="Markdown"
         )
         return
 
+    arg = args[0] if args else ""
+    if arg not in _AUTOTR_ON + _AUTOTR_OFF + ("",):
+        await update.message.reply_text(
+            "Usage: `/autotr on`, `/autotr off` หรือ `/autotr th en`", parse_mode="Markdown"
+        )
+        return
+
+    if is_group:
+        # ในกลุ่มมีแต่โหมดคู่ภาษา — ค่าต่อคนไม่มีความหมายเมื่อคนอ่านคือทั้งห้อง
+        pair = ChatTranslatePairs.get(chat_id)
+        if arg in _AUTOTR_OFF or (arg == "" and pair):
+            ChatTranslatePairs.clear(chat_id)
+            await update.message.reply_text(
+                "🌐 **Auto-translate: OFF (ห้องนี้)**", parse_mode="Markdown"
+            )
+            return
+        if pair is None:
+            ChatTranslatePairs.set(chat_id, *DEFAULT_PAIR)
+            pair = ChatTranslatePairs.get(chat_id)
+        await update.message.reply_text(_pair_status_text(pair), parse_mode="Markdown")
+        return
+
+    if arg in _AUTOTR_ON:
+        StorageSettings.set_auto_translate(user_id, True)
+    elif arg in _AUTOTR_OFF:
+        StorageSettings.set_auto_translate(user_id, False)
+        ChatTranslatePairs.clear(chat_id)
+    else:
+        # ไม่มีอาร์กิวเมนต์คือสลับค่า จะได้ไม่ต้องจำว่าตอนนี้เปิดอยู่หรือไม่
+        if ChatTranslatePairs.clear(chat_id):
+            await update.message.reply_text("🌐 **Auto-translate: OFF**", parse_mode="Markdown")
+            return
+        current = StorageSettings.get_settings(user_id).get("auto_translate", False)
+        StorageSettings.set_auto_translate(user_id, not current)
+
+    pair = ChatTranslatePairs.get(chat_id)
+    if pair:
+        await update.message.reply_text(_pair_status_text(pair), parse_mode="Markdown")
+        return
     await update.message.reply_text(
         _autotr_status_text(StorageSettings.get_settings(user_id)), parse_mode="Markdown"
     )
@@ -2425,6 +2614,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # โหมดแปลอัตโนมัติ (/autotr) — อยู่หลังโหมด setup เสมอ: ข้อความระหว่าง
     # ตั้งค่า Airtable/Sheets คือคีย์กับ id ไม่ใช่ประโยคที่ควรไปแปล
+    chat = update.effective_chat
+    pair = ChatTranslatePairs.get(chat.id)
+    if pair:
+        translated = await pair_translate_text(text, pair["home"], pair["foreign"])
+        if translated is not None:
+            # ตอบแบบอ้างถึงข้อความต้นฉบับ — ในกลุ่มที่คุยกันเร็ว คำแปลลอย ๆ
+            # ไม่รู้ว่าเป็นของใคร
+            await update.message.reply_text(f"🌐 {translated}", do_quote=True)
+        return
+
+    if chat.type != "private":
+        # ในกลุ่มที่ไม่ได้ตั้งคู่ภาษา บอทต้องเงียบ: คำใบ้ "💡 Try:" ใต้ทุกข้อความ
+        # ของทุกคนคือสแปม และค่าแปลต่อคนใช้เฉพาะแชตส่วนตัว
+        return
+
     settings = StorageSettings.get_settings(user_id)
     if settings.get("auto_translate"):
         lang_code = settings.get("preferred_language", "en")
